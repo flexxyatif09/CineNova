@@ -1,0 +1,278 @@
+name: CineNova Auto-Publish Movies & Series
+
+on:
+  # Har 2 ghante me automatically chalega (100% Free on GitHub Actions - No Render Needed)
+  schedule:
+    - cron: '0 */2 * * *'
+  # GitHub Actions tab se 1-click manual run ke liye
+  workflow_dispatch:
+    inputs:
+      site_url:
+        description: 'Target Movie Website URL (e.g. https://new2.movies4u.garden)'
+        required: false
+        default: 'https://new2.movies4u.garden'
+      max_items:
+        description: 'Max new movies to check per run'
+        required: false
+        default: '10'
+
+jobs:
+  sync-catalog-to-firestore:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Dependencies
+        run: |
+          pip install --upgrade pip
+          pip install requests beautifulsoup4 cloudscraper firebase-admin lxml
+
+      - name: Scrape Movies (4-Step Resolver) & Publish to Firestore (No Duplicates)
+        env:
+          FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+          FIREBASE_DATABASE_ID: "ai-studio-b4986d6d-5a08-4f42-b1a3-e2a1732a7d1e"
+          MOVIES_SITE_URL: ${{ github.event.inputs.site_url || vars.MOVIES_SITE_URL || 'https://new2.movies4u.garden' }}
+          MAX_MOVIES_PER_RUN: ${{ github.event.inputs.max_items || '10' }}
+        run: |
+          python3 - << 'EOF'
+          import html
+          import json
+          import os
+          import re
+          import sys
+          from urllib.parse import urljoin
+          import cloudscraper
+          from bs4 import BeautifulSoup
+          import firebase_admin
+          from firebase_admin import credentials, firestore
+
+          DEFAULT_SITE_URL = os.environ.get("MOVIES_SITE_URL", "https://new2.movies4u.garden").rstrip("/")
+          FIREBASE_DATABASE_ID = os.environ.get("FIREBASE_DATABASE_ID", "ai-studio-b4986d6d-5a08-4f42-b1a3-e2a1732a7d1e")
+          MAX_MOVIES_PER_RUN = int(os.environ.get("MAX_MOVIES_PER_RUN", "10"))
+
+          USER_AGENT = (
+              "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) "
+              "AppleWebKit/537.36 (KHTML, like Gecko) "
+              "Chrome/126.0.0.0 Mobile Safari/537.36"
+          )
+
+          def create_http_session():
+              scraper = cloudscraper.create_scraper(
+                  browser={"browser": "chrome", "platform": "android", "desktop": False}
+              )
+              scraper.headers.update({
+                  "User-Agent": USER_AGENT,
+                  "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                  "Accept-Language": "en-US,en;q=0.9",
+              })
+              return scraper
+
+          def init_firestore_db():
+              raw_sa = os.environ.get("FIREBASE_SERVICE_ACCOUNT", "").strip()
+              if not raw_sa:
+                  print("ERROR: FIREBASE_SERVICE_ACCOUNT secret is missing in GitHub Settings -> Secrets -> Actions!")
+                  sys.exit(1)
+              cred = credentials.Certificate(json.loads(raw_sa))
+              if not firebase_admin._apps:
+                  firebase_admin.initialize_app(cred)
+              return firestore.client(database_id=FIREBASE_DATABASE_ID)
+
+          def clean_movie_title_and_year(raw_title: str):
+              text = html.unescape(re.sub(r"<[^>]+>", "", raw_title)).strip()
+              is_series = bool(re.search(r"\b(Season\s*\d+|S\d{1,2}|Complete\s+Series|Episodes?|Ep-\d+|Web\s*Series|Reality\s+Show)\b", text, re.I))
+              year_match = re.search(r"\b(19[89]\d|20[0-3]\d)\b", text)
+              year = int(year_match.group(1)) if year_match else 2026
+              language = "Hindi"
+              if re.search(r"Multi\s*Audio|Dual\s*Audio", text, re.I):
+                  language = "Hindi (Multi Audio)"
+              elif re.search(r"\bEnglish\b", text, re.I) and not re.search(r"\bHindi\b", text, re.I):
+                  language = "English"
+              clean = re.split(
+                  r"\(\s*(?:19|20)\d{2}\s*\)|\[|480p|720p|1080p|2160p|4K|WEB-DL|HDRip|BluRay|HEVC|Download|Season\s*\d+|\bS\d{1,2}\b",
+                  text, maxsplit=1, flags=re.I
+              )[0]
+              clean = re.sub(r"[-–:|]+$", "", clean).strip() or text[:60].strip()
+              return clean, year, language, ("series" if is_series else "movie")
+
+          def normalize_key(title: str, year: int) -> str:
+              slug = re.sub(r"[^a-z0-9]+", "_", title.lower()).strip("_")
+              return f"{slug}_{year}"
+
+          def extract_poster_from_html(post_html: str) -> str:
+              og_m = re.search(r'property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', post_html, re.I)
+              if og_m and og_m.group(1).startswith("http"):
+                  return og_m.group(1).strip()
+              tmdb_m = re.search(r'(https://image\.tmdb\.org/t/p/[^"\'\s>]+)', post_html, re.I)
+              if tmdb_m:
+                  return tmdb_m.group(1).strip()
+              return ""
+
+          def extract_multi_hop_links(session, post_url: str, post_html: str):
+              soup = BeautifulSoup(post_html, "lxml")
+              step1_candidates = []
+              for a in soup.find_all("a", href=True):
+                  href = urljoin(post_url, a["href"].strip())
+                  txt = a.get_text(" ", strip=True)
+                  if any(k in href.lower() for k in ("m4ulinks", "hubcloud", "vcloud", "gdflix")) or "download links" in txt.lower():
+                      if not href.startswith("#") and not href.startswith("javascript:") and "/drive/admin" not in href.lower():
+                          step1_candidates.append(href)
+              if not step1_candidates:
+                  return None
+
+              current_url = step1_candidates[len(step1_candidates) // 2]
+
+              # Step 2: m4ulinks.sbs -> Hub-Cloud [DD] (hubcloud.ist/drive/...)
+              if "m4ulinks" in current_url.lower():
+                  try:
+                      r2 = session.get(current_url, headers={"Referer": post_url}, timeout=12)
+                      if r2.ok:
+                          s2 = BeautifulSoup(r2.text, "lxml")
+                          hub_links = [
+                              urljoin(current_url, a["href"].strip())
+                              for a in s2.find_all("a", href=True)
+                              if ("hubcloud" in a["href"].lower() or "vcloud" in a["href"].lower() or "hub-cloud" in a.get_text(" ", strip=True).lower())
+                              and "/drive/admin" not in a["href"].lower()
+                          ]
+                          if hub_links:
+                              current_url = hub_links[len(hub_links) // 2]
+                  except Exception as e:
+                      print(f"  [Warn] Hop 2 error: {e}")
+
+              return current_url
+
+          def fetch_recent_posts(session, base_url: str, max_posts: int):
+              posts = []
+              api_url = f"{base_url}/wp-json/wp/v2/posts?per_page={max_posts}&_embed=1"
+              try:
+                  resp = session.get(api_url, timeout=15)
+                  if resp.ok and "json" in resp.headers.get("Content-Type", "").lower():
+                      for item in resp.json():
+                          raw_title = item.get("title", {}).get("rendered", "")
+                          post_link = item.get("link", "")
+                          if not post_link:
+                              continue
+                          full_html = item.get("content", {}).get("rendered", "")
+                          try:
+                              pr = session.get(post_link, timeout=15)
+                              if pr.ok:
+                                  full_html = pr.text
+                          except Exception as e:
+                              print(f"  [Warn] Full page fetch fallback for {post_link}: {e}")
+
+                          poster_url = extract_poster_from_html(full_html)
+                          if not poster_url:
+                              media_list = item.get("_embedded", {}).get("wp:featuredmedia", [])
+                              if media_list and isinstance(media_list, list):
+                                  poster_url = media_list[0].get("source_url", "")
+
+                          excerpt_text = BeautifulSoup(item.get("excerpt", {}).get("rendered", ""), "lxml").get_text(" ", strip=True)
+                          posts.append({
+                              "raw_title": raw_title,
+                              "url": post_link,
+                              "html": full_html,
+                              "poster": poster_url,
+                              "synopsis": excerpt_text,
+                          })
+                      if posts:
+                          return posts
+              except Exception as e:
+                  print(f"[Info] WP API fallback ({e})")
+
+              resp = session.get(base_url, timeout=15)
+              resp.raise_for_status()
+              soup = BeautifulSoup(resp.text, "lxml")
+              seen = set()
+              for el in soup.select("article, .post, .movie-card, .entry-title a, h2 a, h3 a"):
+                  a_tag = el if el.name == "a" else el.find("a", href=True)
+                  if not a_tag or not a_tag.get("href"):
+                      continue
+                  u = urljoin(base_url, a_tag["href"].strip())
+                  if u in seen or u.rstrip("/") == base_url.rstrip("/"):
+                      continue
+                  seen.add(u)
+                  try:
+                      pr = session.get(u, timeout=15)
+                      if not pr.ok:
+                          continue
+                      ps = BeautifulSoup(pr.text, "lxml")
+                      h1 = ps.find("h1")
+                      raw_title = h1.get_text(" ", strip=True) if h1 else a_tag.get_text(" ", strip=True)
+                      poster_url = extract_poster_from_html(pr.text)
+                      og_desc = ps.find("meta", property="og:description")
+                      synopsis = og_desc["content"] if og_desc and og_desc.get("content") else ""
+                      posts.append({"raw_title": raw_title, "url": u, "html": pr.text, "poster": poster_url, "synopsis": synopsis})
+                      if len(posts) >= max_posts:
+                          break
+                  except Exception:
+                      pass
+              return posts
+
+          db = init_firestore_db()
+          session = create_http_session()
+          titles_ref = db.collection("titles")
+
+          existing_keys = {}
+          for doc in titles_ref.stream():
+              d = doc.to_dict() or {}
+              t_name = str(d.get("title", "")).strip()
+              t_year = int(d.get("year", 2026) or 2026)
+              if t_name:
+                  existing_keys[normalize_key(t_name, t_year)] = doc.id
+
+          print(f"Fetching latest {MAX_MOVIES_PER_RUN} posts from {DEFAULT_SITE_URL} ...")
+          posts = fetch_recent_posts(session, DEFAULT_SITE_URL, MAX_MOVIES_PER_RUN)
+          for post in posts:
+              clean_title, year, language, content_type = clean_movie_title_and_year(post["raw_title"])
+              norm_key = normalize_key(clean_title, year)
+              doc_id = f"auto_{norm_key}"[:64]
+              stream_link = extract_multi_hop_links(session, post["url"], post["html"])
+              if not stream_link:
+                  print(f"Skipping '{clean_title}' - no m4ulinks/hubcloud link found.")
+                  continue
+              if norm_key in existing_keys:
+                  titles_ref.document(existing_keys[norm_key]).update({
+                      "videoUrl": stream_link[:500],
+                      "updatedAt": firestore.SERVER_TIMESTAMP,
+                  })
+                  print(f"Updated existing '{clean_title}' ({year}) -> {stream_link} (No Duplicate).")
+                  continue
+              poster = (post["poster"] or "drawable://img_hero_nebula")[:500]
+              titles_ref.document(doc_id).set({
+                  "authorId": "github_automation",
+                  "type": content_type,
+                  "title": clean_title[:200],
+                  "description": (post["synopsis"] or f"Watch and download {clean_title} ({year}) in {language}.")[:2000],
+                  "poster": poster,
+                  "backdrop": poster,
+                  "genres": ["Action", "Drama"],
+                  "cast": ["Featured Cast"],
+                  "director": "Original Release",
+                  "language": language[:50],
+                  "year": year,
+                  "rating": 8.4,
+                  "ageRating": "U/A 16+",
+                  "duration": "2h 15m",
+                  "trailerUrl": stream_link[:500],
+                  "videoUrl": stream_link[:500],
+                  "subtitles": ["English", "Hindi"],
+                  "audioTracks": ["Hindi", "English"],
+                  "isFeatured": True,
+                  "isTrending": True,
+                  "isNewRelease": True,
+                  "isPublished": True,
+                  "viewsCount": 0,
+                  "seasonCount": 1,
+                  "createdAt": firestore.SERVER_TIMESTAMP,
+                  "updatedAt": firestore.SERVER_TIMESTAMP,
+              }, merge=True)
+              existing_keys[norm_key] = doc_id
+              print(f"Published NEW '{clean_title}' ({year}) | Poster: {poster} | Link: {stream_link}")
+          EOF
