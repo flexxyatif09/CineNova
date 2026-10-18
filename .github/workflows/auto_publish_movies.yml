@@ -38,7 +38,7 @@ jobs:
       - name: Scrape Movies (4-Step Resolver) & Publish to Firestore (No Duplicates)
         env:
           FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
-          FIREBASE_DATABASE_ID: "ai-studio-b4986d6d-5a08-4f42-b1a3-e2a1732a7d1e"
+          FIREBASE_DATABASE_ID: "ai-studio-android-devbuild-a9589065-5570-4074-a613-1c0430bf6841"
           MOVIES_SITE_URL: ${{ github.event.inputs.site_url || vars.MOVIES_SITE_URL || 'https://new2.movies4u.garden' }}
           MAX_MOVIES_PER_RUN: ${{ github.event.inputs.max_items || '10' }}
         run: |
@@ -55,7 +55,10 @@ jobs:
           from firebase_admin import credentials, firestore
 
           DEFAULT_SITE_URL = os.environ.get("MOVIES_SITE_URL", "https://new2.movies4u.garden").rstrip("/")
-          FIREBASE_DATABASE_ID = os.environ.get("FIREBASE_DATABASE_ID", "ai-studio-b4986d6d-5a08-4f42-b1a3-e2a1732a7d1e")
+          FIREBASE_DATABASE_ID = os.environ.get(
+              "FIREBASE_DATABASE_ID",
+              "ai-studio-android-devbuild-a9589065-5570-4074-a613-1c0430bf6841"
+          )
           MAX_MOVIES_PER_RUN = int(os.environ.get("MAX_MOVIES_PER_RUN", "10"))
 
           USER_AGENT = (
@@ -80,10 +83,32 @@ jobs:
               if not raw_sa:
                   print("ERROR: FIREBASE_SERVICE_ACCOUNT secret is missing in GitHub Settings -> Secrets -> Actions!")
                   sys.exit(1)
-              cred = credentials.Certificate(json.loads(raw_sa))
+              sa_info = json.loads(raw_sa)
+              print(f"Authenticated with Firebase Project: {sa_info.get('project_id')}")
+              cred = credentials.Certificate(sa_info)
               if not firebase_admin._apps:
                   firebase_admin.initialize_app(cred)
-              return firestore.client(database_id=FIREBASE_DATABASE_ID)
+
+              # Try the exact CineNova database ID first, then fall back to (default) if needed
+              candidates = [
+                  FIREBASE_DATABASE_ID,
+                  "ai-studio-android-devbuild-a9589065-5570-4074-a613-1c0430bf6841",
+                  "(default)",
+              ]
+              seen = set()
+              for db_id in candidates:
+                  if not db_id or db_id in seen:
+                      continue
+                  seen.add(db_id)
+                  try:
+                      client = firestore.client(database_id=db_id)
+                      list(client.collection("titles").limit(1).stream())
+                      print(f"Successfully connected to Firestore Database ID: '{db_id}'")
+                      return client
+                  except Exception as e:
+                      print(f"[Info] Database '{db_id}' not accessible ({e}), trying next...")
+
+              raise RuntimeError("Could not connect to any Firestore database in this project!")
 
           def clean_movie_title_and_year(raw_title: str):
               text = html.unescape(re.sub(r"<[^>]+>", "", raw_title)).strip()
