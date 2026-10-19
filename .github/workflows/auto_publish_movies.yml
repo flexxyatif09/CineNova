@@ -35,7 +35,7 @@ jobs:
           pip install --upgrade pip
           pip install requests beautifulsoup4 cloudscraper firebase-admin lxml
 
-      - name: Scrape All Movies & Series + Clean Extra Episodes & Publish to Firestore
+      - name: Scrape All Movies & Series + Clean Titles, Duplicates & Extra Episodes
         env:
           FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
           FIREBASE_DATABASE_ID: "ai-studio-android-devbuild-a9589065-5570-4074-a613-1c0430bf6841"
@@ -122,6 +122,25 @@ jobs:
 
               raise RuntimeError("Could not connect to any Firestore database in this project!")
 
+          def sanitize_display_title(raw_title: str) -> str:
+              """
+              Removes season/year/quality suffixes and strips any trailing '(' or '[' or punctuation.
+              Fixes 'VisionQuest (' -> 'VisionQuest', 'Dark Matter (' -> 'Dark Matter', 'Bigg Boss (' -> 'Bigg Boss'.
+              """
+              text = html.unescape(re.sub(r"<[^>]+>", "", str(raw_title or ""))).strip()
+              clean = re.split(
+                  r"\(\s*(?:19|20)\d{2}\s*\)|\(\s*(?:Season|S)\s*\d+|\[\s*Ep|\[\s*S\d+|\[|480p|720p|1080p|2160p|4K|WEB-DL|HDRip|BluRay|HEVC|HQ-HDTC|HDTC|HDTS|V2\s+HQ|Download|Season\s*\d+|\bS\d{1,2}\b",
+                  text,
+                  maxsplit=1,
+                  flags=re.I,
+              )[0]
+              for opener, closer in [("(", ")"), ("[", "]"), ("{", "}")]:
+                  if opener in clean and closer not in clean:
+                      clean = clean.split(opener, 1)[0]
+              clean = re.sub(r"[\(\[\{\)\]\}\-–—:|/\\]+$", "", clean).strip()
+              clean = re.sub(r"\s{2,}", " ", clean)
+              return clean or text[:60].strip()
+
           def clean_movie_title_and_year(raw_title: str):
               text = html.unescape(re.sub(r"<[^>]+>", "", raw_title)).strip()
               is_series = bool(SERIES_PATTERN.search(text))
@@ -148,29 +167,116 @@ jobs:
               elif re.search(r"\bEnglish\b", text, re.I) and not re.search(r"\bHindi\b", text, re.I):
                   language = "English"
 
-              clean = re.split(
-                  r"\(\s*(?:19|20)\d{2}\s*\)|\[|480p|720p|1080p|2160p|4K|WEB-DL|HDRip|BluRay|HEVC|HQ-HDTC|HDTC|HDTS|V2\s+HQ|Download|Season\s*\d+|\bS\d{1,2}\b",
-                  text, maxsplit=1, flags=re.I
-              )[0]
-              clean = re.sub(r"[-–:|]+$", "", clean).strip() or text[:60].strip()
+              clean = sanitize_display_title(text)
               return clean, year, language, ("series" if is_series else "movie"), season_number
 
           def normalize_key(title: str, year: int) -> str:
-              slug = re.sub(r"[^a-z0-9]+", "_", title.lower()).strip("_")
+              clean = sanitize_display_title(title)
+              slug = re.sub(r"[^a-z0-9]+", "_", clean.lower()).strip("_")
               return f"{slug}_{year}"
 
+          def compact_slug(title: str) -> str:
+              clean = sanitize_display_title(title)
+              return re.sub(r"[^a-z0-9]+", "", clean.lower())
+
+          def title_tokens(title: str) -> set:
+              clean = sanitize_display_title(title).lower()
+              return {w for w in re.findall(r"[a-z0-9]+", clean) if w not in {"the", "a", "an"}}
+
+          def are_titles_duplicate(title1: str, year1: int, type1: str, title2: str, year2: int, type2: str) -> bool:
+              if type1 != type2:
+                  return False
+              s1 = compact_slug(title1)
+              s2 = compact_slug(title2)
+              if s1 and s1 == s2 and (type1 == "series" or abs(year1 - year2) <= 1):
+                  return True
+              if year1 == year2:
+                  t1 = title_tokens(title1)
+                  t2 = title_tokens(title2)
+                  smaller, larger = (t1, t2) if len(t1) <= len(t2) else (t2, t1)
+                  if len(smaller) >= 2 and smaller.issubset(larger) and (len(larger) - len(smaller)) <= 2:
+                      return True
+              return False
+
           def extract_significant_words(title: str) -> set:
-              cleaned = re.sub(r"\(\s*(?:19|20)\d{2}\s*\)|\[.*?\]|Season\s*\d+|S\d{1,2}", " ", title, flags=re.I)
+              cleaned = sanitize_display_title(title)
               words = [w for w in re.findall(r"[a-z0-9]+", cleaned.lower()) if len(w) >= 2 and w not in STOP_WORDS]
               return set(words)
 
           def is_same_title(title_a: str, title_b: str) -> bool:
+              if compact_slug(title_a) and compact_slug(title_a) == compact_slug(title_b):
+                  return True
               words_a = extract_significant_words(title_a)
               words_b = extract_significant_words(title_b)
               if not words_a or not words_b:
                   return False
               overlap = len(words_a & words_b) / max(1, len(words_a))
               return overlap >= 0.65
+
+          def cleanup_titles_and_duplicates_in_firestore(titles_ref):
+              print("Running Firestore Title Sanitizer & Duplicate Remover...")
+              docs_info = []
+              for doc in titles_ref.stream():
+                  d = doc.to_dict() or {}
+                  raw_t = str(d.get("title", "")).strip()
+                  clean_t = sanitize_display_title(raw_t)
+                  year = int(d.get("year", 2026) or 2026)
+                  t_type = str(d.get("type", "movie")).strip()
+                  video_url = str(d.get("videoUrl", "")).strip()
+
+                  if raw_t and clean_t != raw_t:
+                      try:
+                          doc.reference.update({"title": clean_t, "isUpcoming": False})
+                          print(f"  [Title Fixed] '{raw_t}' -> '{clean_t}' ({doc.id})")
+                      except Exception as e:
+                          print(f"  [Warn] Could not update title for {doc.id}: {e}")
+
+                  score = 0
+                  if any(k in video_url.lower() for k in ("hubcloud", "vcloud", "gdflix")):
+                      score += 50
+                  if doc.id.startswith("auto_"):
+                      score += 25
+                  if str(d.get("poster", "")).startswith("http"):
+                      score += 10
+
+                  docs_info.append({
+                      "id": doc.id,
+                      "ref": doc.reference,
+                      "title": clean_t,
+                      "year": year,
+                      "type": t_type,
+                      "score": score,
+                  })
+
+              kept = []
+              for item in docs_info:
+                  dup_idx = None
+                  for idx, existing in enumerate(kept):
+                      if are_titles_duplicate(
+                          existing["title"], existing["year"], existing["type"],
+                          item["title"], item["year"], item["type"]
+                      ):
+                          dup_idx = idx
+                          break
+
+                  if dup_idx is None:
+                      kept.append(item)
+                  else:
+                      existing = kept[dup_idx]
+                      if item["score"] > existing["score"]:
+                          victim = existing
+                          kept[dup_idx] = item
+                      else:
+                          victim = item
+                      try:
+                          for ep in victim["ref"].collection("episodes").stream():
+                              ep.reference.delete()
+                          victim["ref"].delete()
+                          print(f"  [Duplicate Removed] Deleted duplicate '{victim['title']}' ({victim['id']}), kept '{kept[dup_idx]['title']}' ({kept[dup_idx]['id']})")
+                      except Exception as e:
+                          print(f"  [Warn] Failed deleting duplicate {victim['id']}: {e}")
+
+              return kept
 
           def extract_poster_from_html(post_html: str) -> str:
               og_m = re.search(r'property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', post_html, re.I)
@@ -220,10 +326,6 @@ jobs:
               return current_url
 
           def extract_all_episodes(session, post_url: str, post_html: str, default_season: int = 1):
-              """
-              Strictly extracts ONLY the real episodes present on a web series post on new2.movies4u.garden.
-              Returns a dict mapping `(season_num, ep_num) -> real_stream_url`.
-              """
               m4u_links = re.findall(r"href=[\x27\"](https?://[^\x27\"<>]*m4ulinks[^\x27\"<>]*)[\x27\"]", post_html, re.I)
               m4u_links = list(dict.fromkeys([u for u in m4u_links if "/drive/admin" not in u.lower()]))
 
@@ -286,10 +388,6 @@ jobs:
               return episodes_by_season_ep
 
           def sync_and_clean_series_episodes(titles_ref, doc_id: str, clean_title: str, poster: str, episodes_map: dict):
-              """
-              1. Deletes any extra/faltu/wrong episodes in `titles/{doc_id}/episodes` NOT in `episodes_map`.
-              2. Publishes ONLY the exact real episodes with their real stream URLs.
-              """
               episodes_col = titles_ref.document(doc_id).collection("episodes")
               valid_doc_ids = {f"ep_s{s_num}_e{ep_num}" for (s_num, ep_num) in episodes_map.keys()}
 
@@ -355,7 +453,7 @@ jobs:
                   if doc.id in synced_doc_ids:
                       continue
                   d = doc.to_dict() or {}
-                  t_name = str(d.get("title", "")).strip()
+                  t_name = sanitize_display_title(str(d.get("title", "")).strip())
                   t_type = str(d.get("type", "movie")).strip()
                   is_series = (t_type == "series") or bool(SERIES_PATTERN.search(t_name))
                   if not is_series or not t_name:
@@ -391,6 +489,7 @@ jobs:
                                   first_link = eps_map[sorted_keys[0]]
                                   max_season = max(s for (s, _) in sorted_keys)
                                   titles_ref.document(doc.id).update({
+                                      "title": t_name,
                                       "type": "series",
                                       "videoUrl": first_link[:500],
                                       "seasonCount": max(1, max_season),
@@ -410,7 +509,7 @@ jobs:
                           if int(ep_data.get("seasonNumber", 1) or 1) == 20 or ep_data.get("authorId") == "github_automation":
                               ep.reference.delete()
                               removed += 1
-                      titles_ref.document(doc.id).update({"seasonCount": 1, "isUpcoming": False})
+                      titles_ref.document(doc.id).update({"title": t_name, "seasonCount": 1, "isUpcoming": False})
                       print(f"  [Cleaned] Removed {removed} polluted episodes from '{t_name}' ({doc.id}).")
 
           def fetch_recent_posts(session, base_url: str, max_posts: int):
@@ -486,17 +585,18 @@ jobs:
 
               return posts
 
+          def find_existing_doc_id(existing_docs: list, title: str, year: int, content_type: str):
+              for item in existing_docs:
+                  if are_titles_duplicate(item["title"], item["year"], item["type"], title, year, content_type):
+                      return item["id"]
+              return None
+
           db = init_firestore_db()
           session = create_http_session()
           titles_ref = db.collection("titles")
 
-          existing_keys = {}
-          for doc in titles_ref.stream():
-              d = doc.to_dict() or {}
-              t_name = str(d.get("title", "")).strip()
-              t_year = int(d.get("year", 2026) or 2026)
-              if t_name:
-                  existing_keys[normalize_key(t_name, t_year)] = doc.id
+          # Step 1: Fix any existing titles ending with "(" and delete duplicate documents in Firestore
+          existing_docs = cleanup_titles_and_duplicates_in_firestore(titles_ref)
 
           print(f"Scraping up to {MAX_MOVIES_PER_RUN} movies & web series from HTML catalog of {DEFAULT_SITE_URL} ...")
           posts = fetch_recent_posts(session, DEFAULT_SITE_URL, MAX_MOVIES_PER_RUN)
@@ -531,11 +631,12 @@ jobs:
                   continue
 
               poster = (post["poster"] or "drawable://img_hero_nebula")[:500]
-              target_doc_id = existing_keys.get(norm_key, doc_id)
-              synced_doc_ids.add(target_doc_id)
+              matched_doc_id = find_existing_doc_id(existing_docs, clean_title, year, content_type)
 
-              if norm_key in existing_keys:
-                  titles_ref.document(target_doc_id).update({
+              if matched_doc_id:
+                  synced_doc_ids.add(matched_doc_id)
+                  titles_ref.document(matched_doc_id).update({
+                      "title": clean_title[:200],
                       "type": content_type,
                       "poster": poster,
                       "backdrop": poster,
@@ -547,14 +648,15 @@ jobs:
                   })
                   if content_type == "series" and episodes_map:
                       ep_count, rem_count = sync_and_clean_series_episodes(
-                          titles_ref, target_doc_id, clean_title, poster, episodes_map
+                          titles_ref, matched_doc_id, clean_title, poster, episodes_map
                       )
-                      print(f"Updated Series '{clean_title}': {ep_count} real episodes synced, {rem_count} extra episodes removed.")
+                      print(f"Updated Series '{clean_title}' ({matched_doc_id}): {ep_count} real episodes synced, {rem_count} extra removed.")
                   else:
-                      print(f"Updated Movie '{clean_title}' ({year}) -> {stream_link}")
+                      print(f"Updated Movie '{clean_title}' ({year}) [{matched_doc_id}] -> {stream_link}")
                   updated_count += 1
                   continue
 
+              synced_doc_ids.add(doc_id)
               titles_ref.document(doc_id).set({
                   "authorId": "github_automation",
                   "type": content_type,
@@ -584,7 +686,12 @@ jobs:
                   "createdAt": firestore.SERVER_TIMESTAMP,
                   "updatedAt": firestore.SERVER_TIMESTAMP,
               }, merge=True)
-              existing_keys[norm_key] = doc_id
+              existing_docs.append({
+                  "id": doc_id,
+                  "title": clean_title,
+                  "year": year,
+                  "type": content_type,
+              })
 
               if content_type == "series":
                   ep_count, rem_count = sync_and_clean_series_episodes(
