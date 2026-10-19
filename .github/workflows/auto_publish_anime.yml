@@ -1,0 +1,400 @@
+name: CineNova Auto-Publish Anime Series
+
+on:
+  # Har 4 ghante me automatically new anime episodes check karega (100% Free on GitHub Actions)
+  schedule:
+    - cron: '0 */4 * * *'
+  # GitHub Actions tab se 1-click manual run ke liye
+  workflow_dispatch:
+    inputs:
+      anime_url:
+        description: 'Specific Anime Post URL (Optional - e.g. https://www.rareanimes.mov/mushoku-tensei-jobless-reincarnation-season-3-hindi-dubbed-episodes-download-hd/)'
+        required: false
+        default: ''
+      anime_search:
+        description: 'Search Anime by Name (Optional - e.g. Mushoku Tensei, Naruto, Slime)'
+        required: false
+        default: ''
+      max_items:
+        description: 'Kitne anime series scrape karne hain (Default: 5)'
+        required: false
+        default: '5'
+      site_url:
+        description: 'Anime Site URL (Default: https://www.rareanimes.mov)'
+        required: false
+        default: 'https://www.rareanimes.mov'
+
+jobs:
+  sync-anime-to-firestore:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Dependencies
+        run: |
+          pip install --upgrade pip
+          pip install requests beautifulsoup4 cloudscraper firebase-admin lxml
+
+      - name: Scrape Anime & Resolve HubCloud Episodes
+        env:
+          FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+          FIREBASE_DATABASE_ID: "ai-studio-android-devbuild-a9589065-5570-4074-a613-1c0430bf6841"
+          ANIME_SITE_URL: ${{ github.event.inputs.site_url || 'https://www.rareanimes.mov' }}
+          ANIME_URL: ${{ github.event.inputs.anime_url || '' }}
+          ANIME_SEARCH: ${{ github.event.inputs.anime_search || '' }}
+          MAX_ANIME_PER_RUN: ${{ github.event.inputs.max_items || '5' }}
+        run: |
+          python3 - << 'EOF'
+          #!/usr/bin/env python3
+          """
+          CineNova Automated Anime Scraper & Firestore Publisher
+          ======================================================
+          - Target Site: https://www.rareanimes.mov (RareToonsIndia / Rare Animes)
+          - Bypasses codedew.com shortener timers in 2 direct requests to extract real HubCloud stream links.
+          - Strictly extracts exact episodes per season with real HubCloud MKV stream URLs.
+          """
+
+          import html
+          import json
+          import os
+          import re
+          import sys
+          from urllib.parse import quote_plus, urljoin
+
+          import firebase_admin
+          from bs4 import BeautifulSoup
+          from firebase_admin import credentials, firestore
+          import requests
+
+          DEFAULT_SITE_URL = os.environ.get("ANIME_SITE_URL", "https://www.rareanimes.mov").rstrip("/")
+          FIREBASE_DATABASE_ID = os.environ.get(
+              "FIREBASE_DATABASE_ID",
+              "ai-studio-android-devbuild-a9589065-5570-4074-a613-1c0430bf6841",
+          )
+          MAX_ANIME_PER_RUN = int(os.environ.get("MAX_ANIME_PER_RUN", 6))
+          SPECIFIC_ANIME_URL = os.environ.get("ANIME_URL", "").strip()
+          ANIME_SEARCH_QUERY = os.environ.get("ANIME_SEARCH", "").strip()
+
+          USER_AGENT = (
+              "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) "
+              "AppleWebKit/537.36 (KHTML, like Gecko) "
+              "Chrome/126.0.0.0 Mobile Safari/537.36"
+          )
+
+
+          def create_http_session():
+              try:
+                  import cloudscraper
+                  session = cloudscraper.create_scraper(
+                      browser={"browser": "chrome", "platform": "android", "desktop": False}
+                  )
+              except Exception:
+                  session = requests.Session()
+
+              session.headers.update(
+                  {
+                      "User-Agent": USER_AGENT,
+                      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                      "Accept-Language": "en-US,en;q=0.9",
+                      "Referer": f"{DEFAULT_SITE_URL}/",
+                  }
+              )
+              return session
+
+
+          def init_firestore_db():
+              raw_service_account = os.environ.get("FIREBASE_SERVICE_ACCOUNT", "").strip()
+              if not raw_service_account:
+                  print("ERROR: FIREBASE_SERVICE_ACCOUNT secret is empty! Add it in GitHub Settings -> Secrets.")
+                  sys.exit(1)
+
+              service_account_dict = json.loads(raw_service_account)
+              print(f"Authenticated with Firebase Project: {service_account_dict.get('project_id')}")
+              cred = credentials.Certificate(service_account_dict)
+              if not firebase_admin._apps:
+                  firebase_admin.initialize_app(cred)
+
+              candidates = [
+                  FIREBASE_DATABASE_ID,
+                  "ai-studio-android-devbuild-a9589065-5570-4074-a613-1c0430bf6841",
+                  "(default)",
+              ]
+              seen = set()
+              for db_id in candidates:
+                  if not db_id or db_id in seen:
+                      continue
+                  seen.add(db_id)
+                  try:
+                      client = firestore.client(database_id=db_id)
+                      list(client.collection("titles").limit(1).stream())
+                      print(f"Successfully connected to Firestore Database ID: '{db_id}'")
+                      return client
+                  except Exception as e:
+                      print(f"[Info] Database '{db_id}' not accessible ({e}), trying next...")
+
+              return firestore.client(database_id=FIREBASE_DATABASE_ID)
+
+
+          def sanitize_anime_title(raw_title: str):
+              """Cleans up raw post title and extracts season & language."""
+              text = html.unescape(re.sub(r"<[^>]+>", "", raw_title)).strip()
+
+              s_m = re.search(r"\b(?:Season|S)\s*0*(\d{1,2})\b", text, re.I)
+              season_number = int(s_m.group(1)) if s_m else 1
+
+              language = "Hindi Dubbed"
+              if re.search(r"Dual\s*Audio|Multi\s*Audio", text, re.I):
+                  language = "Japanese (Multi Audio)"
+              elif re.search(r"Hindi\s*Sub", text, re.I):
+                  language = "Japanese (Hindi Sub)"
+
+              clean = re.sub(r"[\(\[]\s*(?:19|20)\d{2}\s*[\)\]]", "", text, flags=re.I)
+              clean = re.sub(r"[\(\[]\s*(?:Season|S)\s*\d+.*", "", clean, flags=re.I)
+              clean = re.sub(r"\b(?:Season|S)\s*\d+.*", "", clean, flags=re.I)
+              clean = re.sub(r"\b(?:Hindi\s*Dubbed|Hindi\s*Subbed|Dual\s*Audio|Episodes?\s*Download|Download\s*HD|All\s*Episodes)\b.*", "", clean, flags=re.I)
+
+              for opener, closer in [("(", ")"), ("[", "]"), ("{", "}")]:
+                  if opener in clean and closer not in clean:
+                      clean = clean.split(opener, 1)[0]
+              clean = re.sub(r"[\(\[\{\)\]\}\-–—:|/\\]+$", "", clean).strip()
+              clean = re.sub(r"^[\(\[\{\)\]\}\-–—:|/\\]+", "", clean).strip()
+              clean = re.sub(r"\s{2,}", " ", clean)
+
+              display_title = clean or text[:60].strip()
+              return display_title, season_number, language
+
+
+          def resolve_codedew_to_hubcloud(session, codedew_url: str):
+              """Bypasses codedew.com shortener in 2 fast GET requests."""
+              try:
+                  r1 = session.get(codedew_url, timeout=12)
+                  if not r1.ok:
+                      return None
+
+                  h1 = r1.text
+                  step1_links = re.findall(r"data-href=[\x27\"]([^\x27\"]+)[\x27\"]", h1)
+                  if not step1_links:
+                      return None
+
+                  step2_url = urljoin(codedew_url, html.unescape(step1_links[0]))
+                  r2 = session.get(step2_url, headers={"Referer": codedew_url}, timeout=12)
+                  if not r2.ok:
+                      return None
+
+                  h2 = r2.text
+                  step2_links = re.findall(r"data-href=[\x27\"]([^\x27\"]+)[\x27\"]", h2)
+                  if step2_links:
+                      target = html.unescape(step2_links[0])
+                      if "hubcloud" in target.lower():
+                          return target
+              except Exception as e:
+                  print(f"  [Warn] Failed resolving codedew link {codedew_url[:60]}: {e}")
+
+              return None
+
+
+          def extract_anime_episodes(session, post_html: str, post_url: str):
+              episodes_raw = {}
+              blocks = re.split(r"(Episode\s*0*\d+[^<\n]*)", post_html, flags=re.I)
+              current_ep = 1
+
+              for block in blocks:
+                  ep_m = re.match(r"Episode\s*0*(\d+)", block.strip(), re.I)
+                  if ep_m:
+                      current_ep = int(ep_m.group(1))
+                  else:
+                      hub_codedew = re.findall(
+                          r"href=[\x27\"](https?://codedew\.com/zipper/[^\x27\"]+)[\x27\"][^>]*>\s*\[?HubCloud\]?",
+                          block,
+                          re.I,
+                      )
+                      if hub_codedew and current_ep not in episodes_raw:
+                          episodes_raw[current_ep] = hub_codedew[0]
+
+              resolved_episodes = {}
+              print(f"Found {len(episodes_raw)} raw episode links on page. Resolving HubCloud links...")
+              for ep_num in sorted(episodes_raw.keys()):
+                  codedew_link = episodes_raw[ep_num]
+                  real_hubcloud = resolve_codedew_to_hubcloud(session, codedew_link)
+                  if real_hubcloud:
+                      resolved_episodes[ep_num] = real_hubcloud
+                      print(f"  [Ep {ep_num:02d}] -> {real_hubcloud}")
+                  else:
+                      print(f"  [Ep {ep_num:02d}] Could not resolve HubCloud, skipping.")
+
+              return resolved_episodes
+
+
+          def fetch_anime_post_details(session, post_url: str):
+              try:
+                  r = session.get(post_url, timeout=15)
+                  if not r.ok:
+                      return None
+                  html_text = r.text
+                  soup = BeautifulSoup(html_text, "lxml")
+
+                  title_tag = soup.find("h1") or soup.find("title")
+                  raw_title = title_tag.get_text(" ", strip=True) if title_tag else ""
+
+                  og_img = soup.find("meta", property="og:image")
+                  poster = og_img["content"].strip() if og_img and og_img.get("content") else ""
+
+                  og_desc = soup.find("meta", property="og:description")
+                  synopsis = og_desc["content"].strip() if og_desc and og_desc.get("content") else ""
+
+                  return {
+                      "url": post_url,
+                      "html": html_text,
+                      "raw_title": raw_title,
+                      "poster": poster,
+                      "synopsis": synopsis,
+                  }
+              except Exception as e:
+                  print(f"[Error] Failed fetching anime post {post_url}: {e}")
+                  return None
+
+
+          def collect_target_anime_urls(session, base_url: str):
+              if SPECIFIC_ANIME_URL:
+                  print(f"Using explicitly specified Anime URL: {SPECIFIC_ANIME_URL}")
+                  return [SPECIFIC_ANIME_URL]
+
+              if ANIME_SEARCH_QUERY:
+                  print(f"Searching anime by query: '{ANIME_SEARCH_QUERY}' ...")
+                  search_url = f"{base_url}/?s={quote_plus(ANIME_SEARCH_QUERY)}"
+                  r = session.get(search_url, timeout=12)
+                  if r.ok:
+                      links = re.findall(r"<a[^>]+href=[\x27\"](https?://[^/]*rareanimes\.mov/[a-z0-9\-]+-episodes[^\x27\"]*/)[\x27\"]", r.text, re.I)
+                      if not links:
+                          links = re.findall(r"<a[^>]+href=[\x27\"](https?://[^/]*rareanimes\.mov/[a-z0-9\-]+-hindi[^\x27\"]*/)[\x27\"]", r.text, re.I)
+                      unique_links = list(dict.fromkeys(links))
+                      print(f"Found {len(unique_links)} search matches for '{ANIME_SEARCH_QUERY}'.")
+                      return unique_links[:MAX_ANIME_PER_RUN]
+
+              print(f"Scanning anime catalog on {base_url}/home/ ...")
+              r = session.get(f"{base_url}/home/", timeout=15)
+              if not r.ok:
+                  return []
+
+              all_links = re.findall(r"<a[^>]+href=[\x27\"](https?://www\.rareanimes\.mov/[a-z0-9\-]+(?:season|episodes|hindi)[^\x27\"]*/)[\x27\"]", r.text, re.I)
+              unique = list(dict.fromkeys([l for l in all_links if not any(k in l for k in ("disclaimer", "dmca", "contact", "privacy"))]))
+              return unique[:MAX_ANIME_PER_RUN]
+
+
+          def main():
+              print("=" * 65)
+              print("CineNova Anime Scraper & Auto-Publisher (Rare Animes -> HubCloud)")
+              print("=" * 65)
+
+              db = init_firestore_db()
+              session = create_http_session()
+              titles_ref = db.collection("titles")
+
+              target_urls = collect_target_anime_urls(session, DEFAULT_SITE_URL)
+              print(f"Total anime posts to process: {len(target_urls)}")
+
+              published_count = 0
+
+              for idx, post_url in enumerate(target_urls):
+                  print(f"\n[{idx+1}/{len(target_urls)}] Processing: {post_url}")
+                  details = fetch_anime_post_details(session, post_url)
+                  if not details or not details["raw_title"]:
+                      continue
+
+                  clean_title, season_number, language = sanitize_anime_title(details["raw_title"])
+                  episodes_map = extract_anime_episodes(session, details["html"], post_url)
+
+                  if not episodes_map:
+                      print(f"  [Skip] No valid HubCloud episodes resolved for '{clean_title}'.")
+                      continue
+
+                  slug = re.sub(r"[^a-z0-9]+", "_", clean_title.lower()).strip("_")
+                  doc_id = f"anime_{slug}"[:60]
+                  poster = details["poster"] or "drawable://img_hero_nebula"
+                  sorted_eps = sorted(episodes_map.keys())
+                  first_stream = episodes_map[sorted_eps[0]]
+
+                  genres = ["Anime", "Animation", "Action", "Fantasy", "Adventure"]
+                  titles_ref.document(doc_id).set(
+                      {
+                          "authorId": "anime_automation",
+                          "type": "series",
+                          "title": clean_title[:200],
+                          "description": (details["synopsis"] or f"Watch and download {clean_title} Season {season_number} in {language} with full offline support.")[:2000],
+                          "poster": poster[:500],
+                          "backdrop": poster[:500],
+                          "genres": genres,
+                          "cast": ["Original Japanese & Hindi Voice Cast"],
+                          "director": "Anime Studio Release",
+                          "language": language[:50],
+                          "year": 2026,
+                          "rating": 8.7,
+                          "ageRating": "U/A 13+",
+                          "duration": f"Season {season_number}",
+                          "trailerUrl": first_stream[:500],
+                          "videoUrl": first_stream[:500],
+                          "subtitles": ["English", "Hindi"],
+                          "audioTracks": ["Hindi", "Japanese"],
+                          "isFeatured": True,
+                          "isTrending": True,
+                          "isNewRelease": True,
+                          "isUpcoming": False,
+                          "isPublished": True,
+                          "viewsCount": 0,
+                          "seasonCount": max(1, season_number),
+                          "createdAt": firestore.SERVER_TIMESTAMP,
+                          "updatedAt": firestore.SERVER_TIMESTAMP,
+                      },
+                      merge=True,
+                  )
+
+                  episodes_col = titles_ref.document(doc_id).collection("episodes")
+                  valid_ep_ids = set()
+
+                  for ep_num, stream_url in episodes_map.items():
+                      ep_doc_id = f"s{season_number}_ep{ep_num}"
+                      valid_ep_ids.add(ep_doc_id)
+                      episodes_col.document(ep_doc_id).set(
+                          {
+                              "titleId": doc_id,
+                              "seasonNumber": season_number,
+                              "episodeNumber": ep_num,
+                              "title": f"Episode {ep_num}",
+                              "description": f"{clean_title} - Season {season_number}, Episode {ep_num}",
+                              "thumbnail": poster[:500],
+                              "duration": "24m",
+                              "videoUrl": stream_url[:500],
+                              "streamUrl": stream_url[:500],
+                              "isPublished": True,
+                              "createdAt": firestore.SERVER_TIMESTAMP,
+                              "updatedAt": firestore.SERVER_TIMESTAMP,
+                          },
+                          merge=True,
+                      )
+
+                  try:
+                      for old_ep in episodes_col.stream():
+                          if old_ep.id not in valid_ep_ids:
+                              old_ep.reference.delete()
+                  except Exception:
+                      pass
+
+                  published_count += 1
+                  print(f"  => SUCCESS: Published '{clean_title}' Season {season_number} with {len(valid_ep_ids)} real HubCloud episodes!")
+
+              print("\n" + "=" * 65)
+              print(f"Anime Automation Finished! Total Published: {published_count}")
+              print("=" * 65)
+
+
+          if __name__ == "__main__":
+              main()
+          EOF
