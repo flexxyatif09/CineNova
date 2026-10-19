@@ -43,576 +43,575 @@ jobs:
           MAX_ANIME_PER_RUN: ${{ github.event.inputs.max_items || '30' }}
         run: |
           python3 - << 'EOF'
-#!/usr/bin/env python3
-"""
-CineNova Automated Anime Scraper & Firestore Publisher (Full Batch Mode)
-========================================================================
-- Target Site: https://www.rareanimes.mov (RareToonsIndia / Rare Animes)
-- Strictly scrapes <article> post cards across /home/ and /home/page/N/ (ignores header/nav menus).
-- Extracts ONLY real [HubCloud] links per episode and resolves codedew.com -> https://hubcloud.ist/drive/...
-- Auto-cleans any broken non-HubCloud anime entries from Firestore.
-- Smart Incremental Sync:
-  * Skips anime series where all HubCloud episodes for that season are already in Firestore.
-  * If a new episode is added to an ongoing season, resolves ONLY the new episode without re-checking old ones!
-"""
-
-import html
-import json
-import os
-import re
-import sys
-import time
-from urllib.parse import urljoin
-
-import firebase_admin
-from bs4 import BeautifulSoup
-from firebase_admin import credentials, firestore
-import requests
-
-DEFAULT_SITE_URL = os.environ.get("ANIME_SITE_URL", "https://www.rareanimes.mov").rstrip("/")
-FIREBASE_DATABASE_ID = os.environ.get(
-    "FIREBASE_DATABASE_ID",
-    "ai-studio-android-devbuild-a9589065-5570-4074-a613-1c0430bf6841",
-)
-MAX_ANIME_PER_RUN = int(os.environ.get("MAX_ANIME_PER_RUN", 30))
-
-USER_AGENT = (
-    "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/126.0.0.0 Mobile Safari/537.36"
-)
-
-
-def create_http_session():
-    try:
-        import cloudscraper
-        session = cloudscraper.create_scraper(
-            browser={"browser": "chrome", "platform": "android", "desktop": False}
-        )
-    except Exception:
-        session = requests.Session()
-
-    session.headers.update(
-        {
-            "User-Agent": USER_AGENT,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Referer": f"{DEFAULT_SITE_URL}/",
-        }
-    )
-    return session
-
-
-def init_firestore_db():
-    raw_service_account = os.environ.get("FIREBASE_SERVICE_ACCOUNT", "").strip()
-    if not raw_service_account:
-        print("ERROR: FIREBASE_SERVICE_ACCOUNT secret is empty! Add it in GitHub Settings -> Secrets.")
-        sys.exit(1)
-
-    service_account_dict = json.loads(raw_service_account)
-    print(f"Authenticated with Firebase Project: {service_account_dict.get('project_id')}")
-    cred = credentials.Certificate(service_account_dict)
-    if not firebase_admin._apps:
-        firebase_admin.initialize_app(cred)
-
-    candidates = [
-        FIREBASE_DATABASE_ID,
-        "ai-studio-android-devbuild-a9589065-5570-4074-a613-1c0430bf6841",
-        "(default)",
-    ]
-    seen = set()
-    for db_id in candidates:
-        if not db_id or db_id in seen:
-            continue
-        seen.add(db_id)
-        try:
-            client = firestore.client(database_id=db_id)
-            list(client.collection("titles").limit(1).stream())
-            print(f"Successfully connected to Firestore Database ID: '{db_id}'")
-            return client
-        except Exception as e:
-            print(f"[Info] Database '{db_id}' not accessible ({e}), trying next...")
-
-    return firestore.client(database_id=FIREBASE_DATABASE_ID)
-
-
-def sanitize_anime_title(raw_title: str):
-    """Cleans up raw post title, removes unwanted parentheses, and extracts season & language."""
-    text = html.unescape(re.sub(r"<[^>]+>", "", raw_title or "")).strip()
-
-    # Extract season number
-    s_m = re.search(r"\b(?:Season|S)\s*0*(\d{1,2})\b", text, re.I)
-    season_number = int(s_m.group(1)) if s_m else 1
-
-    # Extract language
-    language = "Hindi Dubbed"
-    if re.search(r"Dual\s*Audio|Multi\s*Audio| Tamil| Telugu", text, re.I):
-        language = "Multi Audio (Hindi)"
-    elif re.search(r"Hindi\s*Sub", text, re.I):
-        language = "Japanese (Hindi Sub)"
-
-    # Clean display title
-    clean = re.sub(r"[\(\[]\s*(?:19|20)\d{2}\s*[\)\]]", "", text, flags=re.I)
-    clean = re.sub(r"[\(\[]\s*(?:Season|S)\s*\d+.*", "", clean, flags=re.I)
-    clean = re.sub(r"\b(?:Season|S)\s*\d+.*", "", clean, flags=re.I)
-    clean = re.sub(
-        r"\b(?:Hindi\s*Dubbed|Hindi\s*Subbed|Hindi|Tamil|Telugu|Dual\s*Audio|Multi\s*Audio|Episodes?\s*Download|Download\s*HD|All\s*Episodes|Watch\s*Download|Download\s*480p.*)\b.*",
-        "",
-        clean,
-        flags=re.I,
-    )
-
-    # Strip incomplete/dangling opening brackets like "(" or "[" at the end
-    for opener, closer in [("(", ")"), ("[", "]"), ("{", "}")]:
-        if opener in clean and closer not in clean:
-            clean = clean.split(opener, 1)[0]
-
-    clean = re.sub(r"[\(\[\{\)\]\}\-–—:|/\\,\.]+$", "", clean).strip()
-    clean = re.sub(r"^[\(\[\{\)\]\}\-–—:|/\\,\.]+", "", clean).strip()
-    clean = re.sub(r"\s{2,}", " ", clean)
-
-    display_title = clean or text[:60].strip()
-    return display_title, season_number, language
-
-
-def resolve_codedew_to_hubcloud(session, codedew_url: str, post_url: str = ""):
-    """
-    Bypasses codedew.com shortener in 2 fast GET requests to extract real HubCloud drive URLs.
-    Step 1: GET codedew_url -> extracts data-href with ad_done=1
-    Step 2: GET step2_url (with Referer=codedew_url) -> extracts final https://hubcloud.../drive/... URL
-    """
-    try:
-        req_headers = {"Referer": post_url or f"{DEFAULT_SITE_URL}/"}
-        r1 = session.get(codedew_url, headers=req_headers, timeout=12)
-        if not r1.ok:
-            return None
-
-        h1 = r1.text
-
-        # Check if hubcloud link is already directly on page 1
-        direct_hub = re.findall(r"href=[\x27\"](https?://[^/]*hubcloud[^\x27\"]+)[\x27\"]", h1, re.I)
-        if direct_hub:
-            return html.unescape(direct_hub[0])
-
-        step1_links = re.findall(r"data-href=[\x27\"]([^\x27\"]+)[\x27\"]", h1)
-        if not step1_links:
-            step1_links = re.findall(r"href=[\x27\"]([^\x27\"]*ad_done=1[^\x27\"]*)[\x27\"]", h1)
-        if not step1_links:
-            return None
-
-        step2_url = urljoin(codedew_url, html.unescape(step1_links[0]))
-        r2 = session.get(step2_url, headers={"Referer": codedew_url}, timeout=12)
-        if not r2.ok:
-            return None
-
-        h2 = r2.text
-        step2_links = re.findall(r"data-href=[\x27\"]([^\x27\"]+)[\x27\"]", h2)
-        for candidate in step2_links:
-            target = html.unescape(candidate)
-            if "hubcloud" in target.lower():
-                return target
-
-        direct_hub2 = re.findall(r"href=[\x27\"](https?://[^/]*hubcloud[^\x27\"]+)[\x27\"]", h2, re.I)
-        if direct_hub2:
-            return html.unescape(direct_hub2[0])
-    except Exception as e:
-        print(f"  [Warn] Failed resolving codedew link {codedew_url[:60]}: {e}")
-
-    return None
-
-
-def extract_raw_hubcloud_episode_map(post_html: str):
-    """
-    Pure in-memory regex parser: extracts {episode_number: [codedew_hubcloud_urls]}
-    strictly matching anchor tags whose label is 'HubCloud'.
-    """
-    episodes_raw = {}
-    blocks = re.split(r"(Episode\s*0*\d+[^<\n]*)", post_html, flags=re.I)
-    current_ep = 1
-    found_any_ep_heading = False
-
-    for block in blocks:
-        ep_m = re.match(r"Episode\s*0*(\d+)", block.strip(), re.I)
-        if ep_m:
-            current_ep = int(ep_m.group(1))
-            found_any_ep_heading = True
-        else:
-            if not found_any_ep_heading and len(blocks) > 1:
-                continue
-            a_tags = re.findall(
-                r"<a\s+[^>]*href=[\x27\"](https?://codedew\.com/[^\x27\"]+)[\x27\"][^>]*>((?:(?!</a>)[\s\S])*)</a>",
-                block,
-                re.I,
-            )
-            hub_links = [
-                href
-                for href, inner in a_tags
-                if "hubcloud" in re.sub(r"<[^>]+>", "", inner).lower()
-            ]
-            if hub_links:
-                episodes_raw.setdefault(current_ep, []).extend(hub_links)
-
-    # Single Anime Movie fallback (when page has HubCloud links without "Episode 01" headings)
-    if not episodes_raw:
-        a_tags = re.findall(
-            r"<a\s+[^>]*href=[\x27\"](https?://codedew\.com/[^\x27\"]+)[\x27\"][^>]*>((?:(?!</a>)[\s\S])*)</a>",
-            post_html,
-            re.I,
-        )
-        hub_links = [
-            href
-            for href, inner in a_tags
-            if "hubcloud" in re.sub(r"<[^>]+>", "", inner).lower()
-        ]
-        if hub_links:
-            episodes_raw[1] = hub_links
-
-    return episodes_raw
-
-
-def resolve_anime_episodes(session, raw_ep_map: dict, existing_season_eps: dict, post_url: str):
-    """
-    Resolves codedew -> HubCloud links for each episode in raw_ep_map.
-    Reuses existing valid HubCloud links from Firestore so already-added episodes are NEVER re-checked!
-    """
-    resolved_episodes = {}
-    print(f"Found {len(raw_ep_map)} HubCloud episode entries on page.")
-
-    for ep_num in sorted(raw_ep_map.keys()):
-        # If this episode is already in Firestore with a valid HubCloud URL, reuse it immediately!
-        if ep_num in existing_season_eps and "hubcloud" in existing_season_eps[ep_num].lower():
-            resolved_episodes[ep_num] = existing_season_eps[ep_num]
-            print(f"  [Ep {ep_num:02d}] Already has HubCloud link -> {existing_season_eps[ep_num]}")
-            continue
-
-        candidates = raw_ep_map[ep_num]
-        real_hubcloud = None
-        # Try highest quality (last candidate, usually 1080p/720p) first, then fallback to earlier ones
-        seen_c = set()
-        for codedew_link in reversed(candidates):
-            if codedew_link in seen_c:
-                continue
-            seen_c.add(codedew_link)
-            real_hubcloud = resolve_codedew_to_hubcloud(session, codedew_link, post_url)
-            if real_hubcloud and "hubcloud" in real_hubcloud.lower():
-                break
-
-        if real_hubcloud and "hubcloud" in real_hubcloud.lower():
-            resolved_episodes[ep_num] = real_hubcloud
-            print(f"  [Ep {ep_num:02d}] Resolved HubCloud -> {real_hubcloud}")
-        else:
-            print(f"  [Ep {ep_num:02d}] Could not resolve HubCloud link, skipping episode.")
-
-    return resolved_episodes
-
-
-def fetch_anime_post_details(session, post_url: str):
-    """Fetches full post HTML and extracts metadata."""
-    try:
-        r = session.get(post_url, timeout=15)
-        if not r.ok:
-            return None
-        html_text = r.text
-        soup = BeautifulSoup(html_text, "lxml")
-
-        title_tag = soup.find("h1") or soup.find("title")
-        raw_title = title_tag.get_text(" ", strip=True) if title_tag else ""
-
-        og_img = soup.find("meta", property="og:image")
-        poster = og_img["content"].strip() if og_img and og_img.get("content") else ""
-
-        og_desc = soup.find("meta", property="og:description")
-        synopsis = og_desc["content"].strip() if og_desc and og_desc.get("content") else ""
-
-        return {
-            "url": post_url,
-            "html": html_text,
-            "raw_title": raw_title,
-            "poster": poster,
-            "synopsis": synopsis,
-        }
-    except Exception as e:
-        print(f"[Error] Failed fetching anime post {post_url}: {e}")
-        return None
-
-
-def collect_target_anime_urls(session, base_url: str):
-    """
-    Scrapes anime <article> post cards across /home/ and /home/page/N/ automatically in batch!
-    Strictly ignores top navbar/header menus so old non-HubCloud pages are never picked up.
-    """
-    print(f"Scanning anime <article> feed across {base_url}/home/ pages...")
-    seen = set()
-    collected = []
-
-    pages_to_check = [f"{base_url}/home/"] + [f"{base_url}/home/page/{i}/" for i in range(2, 12)]
-    for page_url in pages_to_check:
-        if len(collected) >= MAX_ANIME_PER_RUN:
-            break
-        try:
-            r = session.get(page_url, timeout=15)
-            if not r.ok:
-                continue
-
-            # Extract strictly from <article> post cards on the page
-            articles = re.findall(r"<article[\s\S]*?</article>", r.text, re.I)
-            for art in articles:
-                m = re.search(
-                    r"href=[\x27\"](https?://(?:www\.)?rareanimes\.mov/[^\x27\"#?]+)[\x27\"]",
-                    art,
-                    re.I,
-                )
-                if not m:
-                    continue
-                clean_url = m.group(1).split("?")[0].rstrip("/") + "/"
-                if clean_url in seen:
-                    continue
-                if any(
-                    k in clean_url
-                    for k in (
-                        "all-anime-cartoon",
-                        "wp-content",
-                        "wp-json",
-                        "feed",
-                        "comments",
-                        "home",
-                        "contact",
-                        "privacy",
-                        "dmca",
-                        "disclaimer",
-                        "about",
-                    )
-                ):
-                    continue
-                seen.add(clean_url)
-                collected.append(clean_url)
-                if len(collected) >= MAX_ANIME_PER_RUN:
-                    break
-        except Exception as e:
-            print(f"[Warn] Error checking page {page_url}: {e}")
-
-    print(f"Total anime article posts collected automatically: {len(collected)}")
-    return collected
-
-
-def load_and_clean_existing_anime(titles_ref):
-    """
-    Loads existing anime from Firestore AND automatically deletes any broken anime documents
-    that were saved with non-HubCloud links (e.g. raw codedew.com links from navbar items).
-    Returns:
-      existing_anime[doc_id] = {
-          "title": str,
-          "seasonCount": int,
-          "videoUrl": str,
-          "seasons_eps": {season_num: {ep_num: stream_url}}
-      }
-    """
-    print("Inspecting existing anime in Firestore & cleaning any non-HubCloud entries...")
-    existing_anime = {}
-    removed_broken = 0
-
-    try:
-        for doc in titles_ref.stream():
-            d = doc.to_dict() or {}
-            g = d.get("genres", [])
-            if not ("Anime" in g or "Animation" in g or doc.id.startswith("anime_")):
-                continue
-
-            video_url = str(d.get("videoUrl", "")).strip()
-            seasons_eps = {}
-            broken_ep_refs = []
-            all_ep_refs = []
-
-            try:
-                for ep_doc in doc.reference.collection("episodes").stream():
-                    all_ep_refs.append(ep_doc.reference)
-                    ep_data = ep_doc.to_dict() or {}
-                    s_num = int(ep_data.get("seasonNumber", 1) or 1)
-                    e_num = int(ep_data.get("episodeNumber", 1) or 1)
-                    s_url = str(ep_data.get("streamUrl") or ep_data.get("videoUrl") or "").strip()
-                    if "hubcloud" in s_url.lower():
-                        seasons_eps.setdefault(s_num, {})[e_num] = s_url
-                    else:
-                        broken_ep_refs.append(ep_doc.reference)
-            except Exception:
-                pass
-
-            # If this anime has NO valid HubCloud links at all (e.g. codedew.com navbar item), delete it completely!
-            if "hubcloud" not in video_url.lower() and not seasons_eps:
-                try:
-                    for eref in all_ep_refs:
-                        eref.delete()
-                    doc.reference.delete()
-                    removed_broken += 1
-                    print(f"  [Cleaned Broken Anime] Removed '{d.get('title', doc.id)}' ({doc.id}) - had non-HubCloud URL: {video_url[:55]}")
-                except Exception as e:
-                    print(f"  [Warn] Failed deleting broken anime {doc.id}: {e}")
-                continue
-
-            # Delete any individual broken non-HubCloud episodes
-            for bref in broken_ep_refs:
-                try:
-                    bref.delete()
-                except Exception:
-                    pass
-
-            existing_anime[doc.id] = {
-                "id": doc.id,
-                "title": d.get("title", ""),
-                "seasonCount": int(d.get("seasonCount", 1) or 1),
-                "videoUrl": video_url,
-                "seasons_eps": seasons_eps,
-            }
-
-        print(f"Loaded {len(existing_anime)} valid HubCloud anime series (Cleaned {removed_broken} broken entries).")
-    except Exception as e:
-        print(f"[Warn] Error inspecting existing anime in Firestore: {e}")
-
-    return existing_anime
-
-
-def main():
-    print("=" * 65)
-    print("CineNova Automated Anime Scraper & Auto-Publisher (HubCloud Batch)")
-    print("=" * 65)
-
-    db = init_firestore_db()
-    session = create_http_session()
-    titles_ref = db.collection("titles")
-
-    existing_anime = load_and_clean_existing_anime(titles_ref)
-
-    target_urls = collect_target_anime_urls(session, DEFAULT_SITE_URL)
-    print(f"Target anime series to process: {len(target_urls)}")
-
-    published_count = 0
-
-    for idx, post_url in enumerate(target_urls):
-        print(f"\n[{idx+1}/{len(target_urls)}] Checking: {post_url}")
-        details = fetch_anime_post_details(session, post_url)
-        if not details or not details["raw_title"]:
-            continue
-
-        clean_title, season_number, language = sanitize_anime_title(details["raw_title"])
-        slug = re.sub(r"[^a-z0-9]+", "_", clean_title.lower()).strip("_")
-        doc_id = f"anime_{slug}"[:60]
-
-        # Parse HubCloud episode buttons from post HTML in memory (0 network calls)
-        raw_ep_map = extract_raw_hubcloud_episode_map(details["html"])
-        if not raw_ep_map:
-            print(f"  [Skip] No HubCloud links available on page for '{clean_title}'.")
-            continue
-
-        existing_season_eps = (
-            existing_anime.get(doc_id, {}).get("seasons_eps", {}).get(season_number, {})
-        )
-
-        # SMART SKIP: If every episode on the page for this season is ALREADY in Firestore with a valid HubCloud link
-        if existing_season_eps and all(ep in existing_season_eps for ep in raw_ep_map.keys()):
-            print(
-                f"  [Already Added] Anime '{clean_title}' Season {season_number} already has all {len(raw_ep_map)} HubCloud episodes in CineNova. Skipping!"
-            )
-            continue
-
-        episodes_map = resolve_anime_episodes(
-            session, raw_ep_map, existing_season_eps, post_url
-        )
-
-        if not episodes_map:
-            print(f"  [Skip] Could not resolve any HubCloud episodes for '{clean_title}'.")
-            continue
-
-        poster = details["poster"] or "drawable://img_hero_nebula"
-        sorted_eps = sorted(episodes_map.keys())
-        first_stream = episodes_map[sorted_eps[0]]
-
-        current_seasons = existing_anime.get(doc_id, {}).get("seasonCount", 1)
-
-        # Publish / Update Series document in Firestore
-        genres = ["Anime", "Animation", "Action", "Fantasy", "Adventure"]
-        titles_ref.document(doc_id).set(
-            {
-                "authorId": "github_automation",
-                "type": "series",
-                "title": clean_title[:200],
-                "description": (
-                    details["synopsis"]
-                    or f"Watch and download {clean_title} Season {season_number} in {language} with full offline support."
-                )[:2000],
-                "poster": poster[:500],
-                "backdrop": poster[:500],
-                "genres": genres,
-                "cast": ["Original Japanese & Hindi Voice Cast"],
-                "director": "Anime Studio Release",
-                "language": language[:50],
-                "year": 2026,
-                "rating": 8.8,
-                "ageRating": "U/A 13+",
-                "duration": f"Season {season_number}",
-                "trailerUrl": first_stream[:500],
-                "videoUrl": first_stream[:500],
-                "subtitles": ["English", "Hindi"],
-                "audioTracks": ["Hindi", "Japanese"],
-                "isFeatured": (published_count < 4),
-                "isTrending": (published_count < 12),
-                "isNewRelease": True,
-                "isUpcoming": False,
-                "isPublished": True,
-                "viewsCount": 0,
-                "seasonCount": max(current_seasons, season_number),
-                "createdAt": firestore.SERVER_TIMESTAMP,
-                "updatedAt": firestore.SERVER_TIMESTAMP,
-            },
-            merge=True,
-        )
-
-        # Publish exact HubCloud episodes to subcollection
-        episodes_col = titles_ref.document(doc_id).collection("episodes")
-        valid_ep_ids = set()
-
-        for ep_num, stream_url in episodes_map.items():
-            ep_doc_id = f"s{season_number}_ep{ep_num}"
-            valid_ep_ids.add(ep_doc_id)
-            episodes_col.document(ep_doc_id).set(
-                {
-                    "titleId": doc_id,
-                    "seasonNumber": season_number,
-                    "episodeNumber": ep_num,
-                    "title": f"Episode {ep_num}",
-                    "description": f"{clean_title} - Season {season_number}, Episode {ep_num}",
-                    "thumbnail": poster[:500],
-                    "duration": "24m",
-                    "videoUrl": stream_url[:500],
-                    "streamUrl": stream_url[:500],
-                    "isPublished": True,
-                    "createdAt": firestore.SERVER_TIMESTAMP,
-                    "updatedAt": firestore.SERVER_TIMESTAMP,
-                },
-                merge=True,
-            )
-
-        published_count += 1
-        existing_anime.setdefault(
-            doc_id,
-            {
-                "id": doc_id,
-                "title": clean_title,
-                "seasonCount": max(current_seasons, season_number),
-                "videoUrl": first_stream,
-                "seasons_eps": {},
-            },
-        )["seasons_eps"][season_number] = dict(episodes_map)
-
-        print(
-            f"  => SUCCESS: Published '{clean_title}' Season {season_number} with {len(valid_ep_ids)} real HubCloud episodes!"
-        )
-
-    print("\n" + "=" * 65)
-    print(f"Anime Automation Finished! Total Series Published/Updated: {published_count}")
-    print("=" * 65)
-
-
-if __name__ == "__main__":
-    main()
-
-EOF
+          #!/usr/bin/env python3
+          """
+          CineNova Automated Anime Scraper & Firestore Publisher (Full Batch Mode)
+          ========================================================================
+          - Target Site: https://www.rareanimes.mov (RareToonsIndia / Rare Animes)
+          - Strictly scrapes <article> post cards across /home/ and /home/page/N/ (ignores header/nav menus).
+          - Extracts ONLY real [HubCloud] links per episode and resolves codedew.com -> https://hubcloud.ist/drive/...
+          - Auto-cleans any broken non-HubCloud anime entries from Firestore.
+          - Smart Incremental Sync:
+            * Skips anime series where all HubCloud episodes for that season are already in Firestore.
+            * If a new episode is added to an ongoing season, resolves ONLY the new episode without re-checking old ones!
+          """
+
+          import html
+          import json
+          import os
+          import re
+          import sys
+          import time
+          from urllib.parse import urljoin
+
+          import firebase_admin
+          from bs4 import BeautifulSoup
+          from firebase_admin import credentials, firestore
+          import requests
+
+          DEFAULT_SITE_URL = os.environ.get("ANIME_SITE_URL", "https://www.rareanimes.mov").rstrip("/")
+          FIREBASE_DATABASE_ID = os.environ.get(
+              "FIREBASE_DATABASE_ID",
+              "ai-studio-android-devbuild-a9589065-5570-4074-a613-1c0430bf6841",
+          )
+          MAX_ANIME_PER_RUN = int(os.environ.get("MAX_ANIME_PER_RUN", 30))
+
+          USER_AGENT = (
+              "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) "
+              "AppleWebKit/537.36 (KHTML, like Gecko) "
+              "Chrome/126.0.0.0 Mobile Safari/537.36"
+          )
+
+
+          def create_http_session():
+              try:
+                  import cloudscraper
+                  session = cloudscraper.create_scraper(
+                      browser={"browser": "chrome", "platform": "android", "desktop": False}
+                  )
+              except Exception:
+                  session = requests.Session()
+
+              session.headers.update(
+                  {
+                      "User-Agent": USER_AGENT,
+                      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                      "Accept-Language": "en-US,en;q=0.9",
+                      "Referer": f"{DEFAULT_SITE_URL}/",
+                  }
+              )
+              return session
+
+
+          def init_firestore_db():
+              raw_service_account = os.environ.get("FIREBASE_SERVICE_ACCOUNT", "").strip()
+              if not raw_service_account:
+                  print("ERROR: FIREBASE_SERVICE_ACCOUNT secret is empty! Add it in GitHub Settings -> Secrets.")
+                  sys.exit(1)
+
+              service_account_dict = json.loads(raw_service_account)
+              print(f"Authenticated with Firebase Project: {service_account_dict.get('project_id')}")
+              cred = credentials.Certificate(service_account_dict)
+              if not firebase_admin._apps:
+                  firebase_admin.initialize_app(cred)
+
+              candidates = [
+                  FIREBASE_DATABASE_ID,
+                  "ai-studio-android-devbuild-a9589065-5570-4074-a613-1c0430bf6841",
+                  "(default)",
+              ]
+              seen = set()
+              for db_id in candidates:
+                  if not db_id or db_id in seen:
+                      continue
+                  seen.add(db_id)
+                  try:
+                      client = firestore.client(database_id=db_id)
+                      list(client.collection("titles").limit(1).stream())
+                      print(f"Successfully connected to Firestore Database ID: '{db_id}'")
+                      return client
+                  except Exception as e:
+                      print(f"[Info] Database '{db_id}' not accessible ({e}), trying next...")
+
+              return firestore.client(database_id=FIREBASE_DATABASE_ID)
+
+
+          def sanitize_anime_title(raw_title: str):
+              """Cleans up raw post title, removes unwanted parentheses, and extracts season & language."""
+              text = html.unescape(re.sub(r"<[^>]+>", "", raw_title or "")).strip()
+
+              # Extract season number
+              s_m = re.search(r"\b(?:Season|S)\s*0*(\d{1,2})\b", text, re.I)
+              season_number = int(s_m.group(1)) if s_m else 1
+
+              # Extract language
+              language = "Hindi Dubbed"
+              if re.search(r"Dual\s*Audio|Multi\s*Audio| Tamil| Telugu", text, re.I):
+                  language = "Multi Audio (Hindi)"
+              elif re.search(r"Hindi\s*Sub", text, re.I):
+                  language = "Japanese (Hindi Sub)"
+
+              # Clean display title
+              clean = re.sub(r"[\(\[]\s*(?:19|20)\d{2}\s*[\)\]]", "", text, flags=re.I)
+              clean = re.sub(r"[\(\[]\s*(?:Season|S)\s*\d+.*", "", clean, flags=re.I)
+              clean = re.sub(r"\b(?:Season|S)\s*\d+.*", "", clean, flags=re.I)
+              clean = re.sub(
+                  r"\b(?:Hindi\s*Dubbed|Hindi\s*Subbed|Hindi|Tamil|Telugu|Dual\s*Audio|Multi\s*Audio|Episodes?\s*Download|Download\s*HD|All\s*Episodes|Watch\s*Download|Download\s*480p.*)\b.*",
+                  "",
+                  clean,
+                  flags=re.I,
+              )
+
+              # Strip incomplete/dangling opening brackets like "(" or "[" at the end
+              for opener, closer in [("(", ")"), ("[", "]"), ("{", "}")]:
+                  if opener in clean and closer not in clean:
+                      clean = clean.split(opener, 1)[0]
+
+              clean = re.sub(r"[\(\[\{\)\]\}\-–—:|/\\,\.]+$", "", clean).strip()
+              clean = re.sub(r"^[\(\[\{\)\]\}\-–—:|/\\,\.]+", "", clean).strip()
+              clean = re.sub(r"\s{2,}", " ", clean)
+
+              display_title = clean or text[:60].strip()
+              return display_title, season_number, language
+
+
+          def resolve_codedew_to_hubcloud(session, codedew_url: str, post_url: str = ""):
+              """
+              Bypasses codedew.com shortener in 2 fast GET requests to extract real HubCloud drive URLs.
+              Step 1: GET codedew_url -> extracts data-href with ad_done=1
+              Step 2: GET step2_url (with Referer=codedew_url) -> extracts final https://hubcloud.../drive/... URL
+              """
+              try:
+                  req_headers = {"Referer": post_url or f"{DEFAULT_SITE_URL}/"}
+                  r1 = session.get(codedew_url, headers=req_headers, timeout=12)
+                  if not r1.ok:
+                      return None
+
+                  h1 = r1.text
+
+                  # Check if hubcloud link is already directly on page 1
+                  direct_hub = re.findall(r"href=[\x27\"](https?://[^/]*hubcloud[^\x27\"]+)[\x27\"]", h1, re.I)
+                  if direct_hub:
+                      return html.unescape(direct_hub[0])
+
+                  step1_links = re.findall(r"data-href=[\x27\"]([^\x27\"]+)[\x27\"]", h1)
+                  if not step1_links:
+                      step1_links = re.findall(r"href=[\x27\"]([^\x27\"]*ad_done=1[^\x27\"]*)[\x27\"]", h1)
+                  if not step1_links:
+                      return None
+
+                  step2_url = urljoin(codedew_url, html.unescape(step1_links[0]))
+                  r2 = session.get(step2_url, headers={"Referer": codedew_url}, timeout=12)
+                  if not r2.ok:
+                      return None
+
+                  h2 = r2.text
+                  step2_links = re.findall(r"data-href=[\x27\"]([^\x27\"]+)[\x27\"]", h2)
+                  for candidate in step2_links:
+                      target = html.unescape(candidate)
+                      if "hubcloud" in target.lower():
+                          return target
+
+                  direct_hub2 = re.findall(r"href=[\x27\"](https?://[^/]*hubcloud[^\x27\"]+)[\x27\"]", h2, re.I)
+                  if direct_hub2:
+                      return html.unescape(direct_hub2[0])
+              except Exception as e:
+                  print(f"  [Warn] Failed resolving codedew link {codedew_url[:60]}: {e}")
+
+              return None
+
+
+          def extract_raw_hubcloud_episode_map(post_html: str):
+              """
+              Pure in-memory regex parser: extracts {episode_number: [codedew_hubcloud_urls]}
+              strictly matching anchor tags whose label is 'HubCloud'.
+              """
+              episodes_raw = {}
+              blocks = re.split(r"(Episode\s*0*\d+[^<\n]*)", post_html, flags=re.I)
+              current_ep = 1
+              found_any_ep_heading = False
+
+              for block in blocks:
+                  ep_m = re.match(r"Episode\s*0*(\d+)", block.strip(), re.I)
+                  if ep_m:
+                      current_ep = int(ep_m.group(1))
+                      found_any_ep_heading = True
+                  else:
+                      if not found_any_ep_heading and len(blocks) > 1:
+                          continue
+                      a_tags = re.findall(
+                          r"<a\s+[^>]*href=[\x27\"](https?://codedew\.com/[^\x27\"]+)[\x27\"][^>]*>((?:(?!</a>)[\s\S])*)</a>",
+                          block,
+                          re.I,
+                      )
+                      hub_links = [
+                          href
+                          for href, inner in a_tags
+                          if "hubcloud" in re.sub(r"<[^>]+>", "", inner).lower()
+                      ]
+                      if hub_links:
+                          episodes_raw.setdefault(current_ep, []).extend(hub_links)
+
+              # Single Anime Movie fallback (when page has HubCloud links without "Episode 01" headings)
+              if not episodes_raw:
+                  a_tags = re.findall(
+                      r"<a\s+[^>]*href=[\x27\"](https?://codedew\.com/[^\x27\"]+)[\x27\"][^>]*>((?:(?!</a>)[\s\S])*)</a>",
+                      post_html,
+                      re.I,
+                  )
+                  hub_links = [
+                      href
+                      for href, inner in a_tags
+                      if "hubcloud" in re.sub(r"<[^>]+>", "", inner).lower()
+                  ]
+                  if hub_links:
+                      episodes_raw[1] = hub_links
+
+              return episodes_raw
+
+
+          def resolve_anime_episodes(session, raw_ep_map: dict, existing_season_eps: dict, post_url: str):
+              """
+              Resolves codedew -> HubCloud links for each episode in raw_ep_map.
+              Reuses existing valid HubCloud links from Firestore so already-added episodes are NEVER re-checked!
+              """
+              resolved_episodes = {}
+              print(f"Found {len(raw_ep_map)} HubCloud episode entries on page.")
+
+              for ep_num in sorted(raw_ep_map.keys()):
+                  # If this episode is already in Firestore with a valid HubCloud URL, reuse it immediately!
+                  if ep_num in existing_season_eps and "hubcloud" in existing_season_eps[ep_num].lower():
+                      resolved_episodes[ep_num] = existing_season_eps[ep_num]
+                      print(f"  [Ep {ep_num:02d}] Already has HubCloud link -> {existing_season_eps[ep_num]}")
+                      continue
+
+                  candidates = raw_ep_map[ep_num]
+                  real_hubcloud = None
+                  # Try highest quality (last candidate, usually 1080p/720p) first, then fallback to earlier ones
+                  seen_c = set()
+                  for codedew_link in reversed(candidates):
+                      if codedew_link in seen_c:
+                          continue
+                      seen_c.add(codedew_link)
+                      real_hubcloud = resolve_codedew_to_hubcloud(session, codedew_link, post_url)
+                      if real_hubcloud and "hubcloud" in real_hubcloud.lower():
+                          break
+
+                  if real_hubcloud and "hubcloud" in real_hubcloud.lower():
+                      resolved_episodes[ep_num] = real_hubcloud
+                      print(f"  [Ep {ep_num:02d}] Resolved HubCloud -> {real_hubcloud}")
+                  else:
+                      print(f"  [Ep {ep_num:02d}] Could not resolve HubCloud link, skipping episode.")
+
+              return resolved_episodes
+
+
+          def fetch_anime_post_details(session, post_url: str):
+              """Fetches full post HTML and extracts metadata."""
+              try:
+                  r = session.get(post_url, timeout=15)
+                  if not r.ok:
+                      return None
+                  html_text = r.text
+                  soup = BeautifulSoup(html_text, "lxml")
+
+                  title_tag = soup.find("h1") or soup.find("title")
+                  raw_title = title_tag.get_text(" ", strip=True) if title_tag else ""
+
+                  og_img = soup.find("meta", property="og:image")
+                  poster = og_img["content"].strip() if og_img and og_img.get("content") else ""
+
+                  og_desc = soup.find("meta", property="og:description")
+                  synopsis = og_desc["content"].strip() if og_desc and og_desc.get("content") else ""
+
+                  return {
+                      "url": post_url,
+                      "html": html_text,
+                      "raw_title": raw_title,
+                      "poster": poster,
+                      "synopsis": synopsis,
+                  }
+              except Exception as e:
+                  print(f"[Error] Failed fetching anime post {post_url}: {e}")
+                  return None
+
+
+          def collect_target_anime_urls(session, base_url: str):
+              """
+              Scrapes anime <article> post cards across /home/ and /home/page/N/ automatically in batch!
+              Strictly ignores top navbar/header menus so old non-HubCloud pages are never picked up.
+              """
+              print(f"Scanning anime <article> feed across {base_url}/home/ pages...")
+              seen = set()
+              collected = []
+
+              pages_to_check = [f"{base_url}/home/"] + [f"{base_url}/home/page/{i}/" for i in range(2, 12)]
+              for page_url in pages_to_check:
+                  if len(collected) >= MAX_ANIME_PER_RUN:
+                      break
+                  try:
+                      r = session.get(page_url, timeout=15)
+                      if not r.ok:
+                          continue
+
+                      # Extract strictly from <article> post cards on the page
+                      articles = re.findall(r"<article[\s\S]*?</article>", r.text, re.I)
+                      for art in articles:
+                          m = re.search(
+                              r"href=[\x27\"](https?://(?:www\.)?rareanimes\.mov/[^\x27\"#?]+)[\x27\"]",
+                              art,
+                              re.I,
+                          )
+                          if not m:
+                              continue
+                          clean_url = m.group(1).split("?")[0].rstrip("/") + "/"
+                          if clean_url in seen:
+                              continue
+                          if any(
+                              k in clean_url
+                              for k in (
+                                  "all-anime-cartoon",
+                                  "wp-content",
+                                  "wp-json",
+                                  "feed",
+                                  "comments",
+                                  "home",
+                                  "contact",
+                                  "privacy",
+                                  "dmca",
+                                  "disclaimer",
+                                  "about",
+                              )
+                          ):
+                              continue
+                          seen.add(clean_url)
+                          collected.append(clean_url)
+                          if len(collected) >= MAX_ANIME_PER_RUN:
+                              break
+                  except Exception as e:
+                      print(f"[Warn] Error checking page {page_url}: {e}")
+
+              print(f"Total anime article posts collected automatically: {len(collected)}")
+              return collected
+
+
+          def load_and_clean_existing_anime(titles_ref):
+              """
+              Loads existing anime from Firestore AND automatically deletes any broken anime documents
+              that were saved with non-HubCloud links (e.g. raw codedew.com links from navbar items).
+              Returns:
+                existing_anime[doc_id] = {
+                    "title": str,
+                    "seasonCount": int,
+                    "videoUrl": str,
+                    "seasons_eps": {season_num: {ep_num: stream_url}}
+                }
+              """
+              print("Inspecting existing anime in Firestore & cleaning any non-HubCloud entries...")
+              existing_anime = {}
+              removed_broken = 0
+
+              try:
+                  for doc in titles_ref.stream():
+                      d = doc.to_dict() or {}
+                      g = d.get("genres", [])
+                      if not ("Anime" in g or "Animation" in g or doc.id.startswith("anime_")):
+                          continue
+
+                      video_url = str(d.get("videoUrl", "")).strip()
+                      seasons_eps = {}
+                      broken_ep_refs = []
+                      all_ep_refs = []
+
+                      try:
+                          for ep_doc in doc.reference.collection("episodes").stream():
+                              all_ep_refs.append(ep_doc.reference)
+                              ep_data = ep_doc.to_dict() or {}
+                              s_num = int(ep_data.get("seasonNumber", 1) or 1)
+                              e_num = int(ep_data.get("episodeNumber", 1) or 1)
+                              s_url = str(ep_data.get("streamUrl") or ep_data.get("videoUrl") or "").strip()
+                              if "hubcloud" in s_url.lower():
+                                  seasons_eps.setdefault(s_num, {})[e_num] = s_url
+                              else:
+                                  broken_ep_refs.append(ep_doc.reference)
+                      except Exception:
+                          pass
+
+                      # If this anime has NO valid HubCloud links at all (e.g. codedew.com navbar item), delete it completely!
+                      if "hubcloud" not in video_url.lower() and not seasons_eps:
+                          try:
+                              for eref in all_ep_refs:
+                                  eref.delete()
+                              doc.reference.delete()
+                              removed_broken += 1
+                              print(f"  [Cleaned Broken Anime] Removed '{d.get('title', doc.id)}' ({doc.id}) - had non-HubCloud URL: {video_url[:55]}")
+                          except Exception as e:
+                              print(f"  [Warn] Failed deleting broken anime {doc.id}: {e}")
+                          continue
+
+                      # Delete any individual broken non-HubCloud episodes
+                      for bref in broken_ep_refs:
+                          try:
+                              bref.delete()
+                          except Exception:
+                              pass
+
+                      existing_anime[doc.id] = {
+                          "id": doc.id,
+                          "title": d.get("title", ""),
+                          "seasonCount": int(d.get("seasonCount", 1) or 1),
+                          "videoUrl": video_url,
+                          "seasons_eps": seasons_eps,
+                      }
+
+                  print(f"Loaded {len(existing_anime)} valid HubCloud anime series (Cleaned {removed_broken} broken entries).")
+              except Exception as e:
+                  print(f"[Warn] Error inspecting existing anime in Firestore: {e}")
+
+              return existing_anime
+
+
+          def main():
+              print("=" * 65)
+              print("CineNova Automated Anime Scraper & Auto-Publisher (HubCloud Batch)")
+              print("=" * 65)
+
+              db = init_firestore_db()
+              session = create_http_session()
+              titles_ref = db.collection("titles")
+
+              existing_anime = load_and_clean_existing_anime(titles_ref)
+
+              target_urls = collect_target_anime_urls(session, DEFAULT_SITE_URL)
+              print(f"Target anime series to process: {len(target_urls)}")
+
+              published_count = 0
+
+              for idx, post_url in enumerate(target_urls):
+                  print(f"\n[{idx+1}/{len(target_urls)}] Checking: {post_url}")
+                  details = fetch_anime_post_details(session, post_url)
+                  if not details or not details["raw_title"]:
+                      continue
+
+                  clean_title, season_number, language = sanitize_anime_title(details["raw_title"])
+                  slug = re.sub(r"[^a-z0-9]+", "_", clean_title.lower()).strip("_")
+                  doc_id = f"anime_{slug}"[:60]
+
+                  # Parse HubCloud episode buttons from post HTML in memory (0 network calls)
+                  raw_ep_map = extract_raw_hubcloud_episode_map(details["html"])
+                  if not raw_ep_map:
+                      print(f"  [Skip] No HubCloud links available on page for '{clean_title}'.")
+                      continue
+
+                  existing_season_eps = (
+                      existing_anime.get(doc_id, {}).get("seasons_eps", {}).get(season_number, {})
+                  )
+
+                  # SMART SKIP: If every episode on the page for this season is ALREADY in Firestore with a valid HubCloud link
+                  if existing_season_eps and all(ep in existing_season_eps for ep in raw_ep_map.keys()):
+                      print(
+                          f"  [Already Added] Anime '{clean_title}' Season {season_number} already has all {len(raw_ep_map)} HubCloud episodes in CineNova. Skipping!"
+                      )
+                      continue
+
+                  episodes_map = resolve_anime_episodes(
+                      session, raw_ep_map, existing_season_eps, post_url
+                  )
+
+                  if not episodes_map:
+                      print(f"  [Skip] Could not resolve any HubCloud episodes for '{clean_title}'.")
+                      continue
+
+                  poster = details["poster"] or "drawable://img_hero_nebula"
+                  sorted_eps = sorted(episodes_map.keys())
+                  first_stream = episodes_map[sorted_eps[0]]
+
+                  current_seasons = existing_anime.get(doc_id, {}).get("seasonCount", 1)
+
+                  # Publish / Update Series document in Firestore
+                  genres = ["Anime", "Animation", "Action", "Fantasy", "Adventure"]
+                  titles_ref.document(doc_id).set(
+                      {
+                          "authorId": "github_automation",
+                          "type": "series",
+                          "title": clean_title[:200],
+                          "description": (
+                              details["synopsis"]
+                              or f"Watch and download {clean_title} Season {season_number} in {language} with full offline support."
+                          )[:2000],
+                          "poster": poster[:500],
+                          "backdrop": poster[:500],
+                          "genres": genres,
+                          "cast": ["Original Japanese & Hindi Voice Cast"],
+                          "director": "Anime Studio Release",
+                          "language": language[:50],
+                          "year": 2026,
+                          "rating": 8.8,
+                          "ageRating": "U/A 13+",
+                          "duration": f"Season {season_number}",
+                          "trailerUrl": first_stream[:500],
+                          "videoUrl": first_stream[:500],
+                          "subtitles": ["English", "Hindi"],
+                          "audioTracks": ["Hindi", "Japanese"],
+                          "isFeatured": (published_count < 4),
+                          "isTrending": (published_count < 12),
+                          "isNewRelease": True,
+                          "isUpcoming": False,
+                          "isPublished": True,
+                          "viewsCount": 0,
+                          "seasonCount": max(current_seasons, season_number),
+                          "createdAt": firestore.SERVER_TIMESTAMP,
+                          "updatedAt": firestore.SERVER_TIMESTAMP,
+                      },
+                      merge=True,
+                  )
+
+                  # Publish exact HubCloud episodes to subcollection
+                  episodes_col = titles_ref.document(doc_id).collection("episodes")
+                  valid_ep_ids = set()
+
+                  for ep_num, stream_url in episodes_map.items():
+                      ep_doc_id = f"s{season_number}_ep{ep_num}"
+                      valid_ep_ids.add(ep_doc_id)
+                      episodes_col.document(ep_doc_id).set(
+                          {
+                              "titleId": doc_id,
+                              "seasonNumber": season_number,
+                              "episodeNumber": ep_num,
+                              "title": f"Episode {ep_num}",
+                              "description": f"{clean_title} - Season {season_number}, Episode {ep_num}",
+                              "thumbnail": poster[:500],
+                              "duration": "24m",
+                              "videoUrl": stream_url[:500],
+                              "streamUrl": stream_url[:500],
+                              "isPublished": True,
+                              "createdAt": firestore.SERVER_TIMESTAMP,
+                              "updatedAt": firestore.SERVER_TIMESTAMP,
+                          },
+                          merge=True,
+                      )
+
+                  published_count += 1
+                  existing_anime.setdefault(
+                      doc_id,
+                      {
+                          "id": doc_id,
+                          "title": clean_title,
+                          "seasonCount": max(current_seasons, season_number),
+                          "videoUrl": first_stream,
+                          "seasons_eps": {},
+                      },
+                  )["seasons_eps"][season_number] = dict(episodes_map)
+
+                  print(
+                      f"  => SUCCESS: Published '{clean_title}' Season {season_number} with {len(valid_ep_ids)} real HubCloud episodes!"
+                  )
+
+              print("\n" + "=" * 65)
+              print(f"Anime Automation Finished! Total Series Published/Updated: {published_count}")
+              print("=" * 65)
+
+
+          if __name__ == "__main__":
+              main()
+          EOF
