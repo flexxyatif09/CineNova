@@ -219,14 +219,14 @@ jobs:
 
 
           def normalize_pixeldrain_url(raw_target: str) -> str:
-              """Converts `/watchbeta/?url=ID` or `pixeldrain.*/u/ID` into direct HTTP 206 stream URL."""
+              """Converts `/watchbeta/?url=ID` or `pixeldrain.*/u/ID` into direct binary API stream URL (`/api/file/ID`)."""
               m_wb = re.search(r"watchbeta/\?url=([A-Za-z0-9_-]+)", raw_target, re.I)
               if m_wb:
-                  return f"https://pixeldrain.net/u/{m_wb.group(1)}?download"
+                  return f"https://pixeldrain.net/api/file/{m_wb.group(1)}"
 
               m_pd = re.search(r"pixeldrain\.[a-z]+/(?:u|api/file)/([A-Za-z0-9_-]+)", raw_target, re.I)
               if m_pd:
-                  return f"https://pixeldrain.net/u/{m_pd.group(1)}?download"
+                  return f"https://pixeldrain.net/api/file/{m_pd.group(1)}"
 
               return ""
 
@@ -582,6 +582,11 @@ jobs:
                               s_num = int(ep_data.get("seasonNumber", 1) or 1)
                               e_num = int(ep_data.get("episodeNumber", 1) or 1)
                               s_url = str(ep_data.get("streamUrl") or ep_data.get("videoUrl") or "").strip()
+                              if "pixeldrain" in s_url.lower() and "/u/" in s_url.lower():
+                                  fixed_pd = normalize_pixeldrain_url(s_url)
+                                  if fixed_pd:
+                                      s_url = fixed_pd
+                                      ep_doc.reference.set({"videoUrl": s_url, "streamUrl": s_url}, merge=True)
                               if is_valid_anime_stream(s_url):
                                   seasons_eps.setdefault(s_num, {})[e_num] = s_url
                               else:
