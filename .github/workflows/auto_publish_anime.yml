@@ -619,9 +619,9 @@ jobs:
                                   else:
                                       default_other.append(href)
 
-                      hindi_candidates = hindi_hub + hindi_multiquality + hindi_dlbeta + hindi_other
-                      default_candidates = default_hub + default_multiquality + default_dlbeta + default_other
-                      regional_candidates = regional_hub + regional_multiquality + regional_dlbeta + regional_other
+                      hindi_candidates = hindi_hub + hindi_dlbeta + hindi_multiquality + hindi_other
+                      default_candidates = default_hub + default_dlbeta + default_multiquality + default_other
+                      regional_candidates = regional_hub + regional_dlbeta + regional_multiquality + regional_other
 
                       # Strictly exclude Tamil/Telugu regional links whenever Hindi links are present on the episode!
                       if hindi_candidates:
