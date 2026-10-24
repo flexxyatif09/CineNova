@@ -44,6 +44,8 @@ jobs:
           FALLBACK_SITE_URL: "https://animedubhindi.link"
           ORIGIN_CLEANUP: "unpublish"
           LINK_RECHECK_BUDGET: "80"
+          DIRECT_HOSTS: "hubcloud,pixeldrain"
+          KEEP_WRAPPER_LINKS: "false"
           PYTHONUNBUFFERED: "1"
         run: |
           python3 -u - << 'EOF'
@@ -681,23 +683,98 @@ jobs:
                       eps.setdefault(cur_ep, []).append((_fb_quality_rank(cur_label), kind, href))
               return eps
 
-          def resolve_fallback_link(session, href: str, referer: str):
-              low = href.lower()
-              if any(k in low for k in FB_HUB_KEYS):
-                  return href
-              got = resolve_codedew_to_hubcloud(session, href, referer)
-              if got and "codedew.com" not in got.lower():
-                  return got
+          import base64
+          from urllib.parse import urlparse, unquote
+
+          DIRECT_HOSTS = tuple(h.strip().lower() for h in os.environ.get("DIRECT_HOSTS", "hubcloud,pixeldrain").split(",") if h.strip())
+
+          def is_direct_host(url: str) -> bool:
               try:
-                  r = session.get(href, timeout=12, allow_redirects=True, headers={"Referer": referer})
-                  if any(k in r.url.lower() for k in FB_HUB_KEYS):
-                      return r.url
-                  m = re.search(r"https?://[^\s\"'<>]*hubcloud[^\s\"'<>]*", r.text, re.I)
-                  if m:
-                      return html.unescape(m.group(0))
+                  host = urlparse((url or "").strip()).netloc.lower()
+              except Exception:
+                  return False
+              return bool(host) and any(h in host for h in DIRECT_HOSTS)
+
+          def link_status(session, url: str, referer: str = "") -> str:
+              # "ok" = direct (hubcloud/pixeldrain) aur chal raha hai | "not_direct" = wrapper/unsupported | "dead"
+              if not is_direct_host(url):
+                  return "not_direct"
+              return "ok" if is_link_alive(session, url, referer) else "dead"
+
+          def _b64_candidates(text: str):
+              toks = re.findall(r"atob\(\s*['\"]([A-Za-z0-9+/=_\-]{12,})['\"]\s*\)", text)
+              toks += [unquote(t) for t in re.findall(
+                  r"[?&](?:url|link|u|id|r|redirect|goto|data|d)=([A-Za-z0-9+/=_\-%]{16,})", text)]
+              out = []
+              for tok in toks:
+                  try:
+                      tok = tok.replace("-", "+").replace("_", "/")
+                      dec = base64.b64decode(tok + "=" * (-len(tok) % 4)).decode("utf-8", "ignore").strip()
+                      if dec.startswith("http"):
+                          out.append(dec)
+                  except Exception:
+                      pass
+              return out
+
+          def _find_direct_urls(text: str):
+              blob = html.unescape(text or "").replace("\\/", "/")
+              found = [u.rstrip(".,;") for u in re.findall(r"https?://[^\s\"'<>\\)]+", blob) if is_direct_host(u)]
+              found += [d for d in _b64_candidates(blob) if is_direct_host(d)]
+              return found
+
+          def _next_hops(text: str, base_url: str):
+              blob = html.unescape(text or "").replace("\\/", "/")
+              hops = re.findall(r"http-equiv=[\"']refresh[\"'][^>]*content=[\"'][^\"']*url=([^\"'>\s]+)", blob, re.I)
+              hops += re.findall(r"(?:location(?:\.href)?\s*=|location\.replace\(|window\.open\()\s*['\"]([^'\"]+)['\"]", blob)
+              try:
+                  soup = BeautifulSoup(text or "", "lxml")
+                  for a in soup.find_all("a", href=True):
+                      label = a.get_text(" ", strip=True).lower()
+                      if any(k in label for k in ("continue", "get link", "go to", "download", "hubcloud", "hcloud", "proceed", "unlock", "click here")):
+                          hops.append(a["href"].strip())
               except Exception:
                   pass
+              out, seen = [], set()
+              for h in hops:
+                  full = urljoin(base_url, h)
+                  if full.startswith("http") and full not in seen and full != base_url:
+                      seen.add(full)
+                      out.append(full)
+              return out
+
+          def extract_direct_link(session, url: str, referer: str = "", depth: int = 0, seen=None):
+              # Wrapper/redirect page se hubcloud/pixeldrain ka direct link nikalta hai (max 3 hop)
+              seen = seen if seen is not None else set()
+              if not url or url in seen or depth > 3:
+                  return None
+              seen.add(url)
+              if is_direct_host(url):
+                  return url
+              try:
+                  r = session.get(url, timeout=12, allow_redirects=True, headers={"Referer": referer or url})
+              except Exception:
+                  return None
+              for h in [r.url] + [x.url for x in getattr(r, "history", [])]:
+                  if is_direct_host(h):
+                      return h
+              found = _find_direct_urls(r.text)
+              if found:
+                  return found[0]
+              for nxt in _next_hops(r.text, r.url)[:3]:
+                  got = extract_direct_link(session, nxt, r.url, depth + 1, seen)
+                  if got:
+                      return got
+              if depth == 0:
+                  log(f"    [Link][Debug] No hubcloud/pixeldrain link found via {urlparse(url).netloc} (final {r.url[:70]}, {len(r.text)} bytes)")
               return None
+
+          def resolve_fallback_link(session, href: str, referer: str):
+              if is_direct_host(href):
+                  return href
+              got = resolve_codedew_to_hubcloud(session, href, referer)
+              if got and is_direct_host(got):
+                  return got
+              return extract_direct_link(session, href, referer)
 
           def fetch_from_animedubhindi(session, clean_title: str, season_number: int, wanted=None, skip=None):
               skip = skip or set()
@@ -729,7 +806,7 @@ jobs:
                   cands = [h for _, _, h in sorted(eps[ep], key=lambda x: (x[0], x[1]))][:6]
                   for href in cands:
                       url = resolve_fallback_link(session, urljoin(r2.url, href), r2.url)
-                      if url and is_link_alive(session, url, r2.url):
+                      if url and link_status(session, url, r2.url) == "ok":
                           result[ep] = url
                           log(f"    [Ep {ep:02d}] Fallback stream -> {url[:60]}...")
                           break
@@ -821,8 +898,8 @@ jobs:
                   return res
               return "error", None
 
-          def link_recheck_due(ep_d: dict, days: int = 7) -> bool:
-              t = (ep_d or {}).get("linkCheckedAt")
+          def link_recheck_due(ep_d: dict, days: int = 7, key: str = "linkCheckedAt") -> bool:
+              t = (ep_d or {}).get(key)
               if not t:
                   return True
               try:
@@ -961,6 +1038,8 @@ jobs:
                   existing_ep_refs = {}
                   dead_eps = set()
                   frozen_dead = set()
+                  upgrade_eps = set()
+                  wrapper_urls = {}
                   try:
                       for ep_doc in titles_ref.document(doc_id).collection("episodes").where("seasonNumber", "==", season_number).stream():
                           ep_d = ep_doc.to_dict() or {}
@@ -974,7 +1053,10 @@ jobs:
                                   frozen_dead.add(e_num)
                               continue
                           if s_url:
-                              existing_season_eps[e_num] = s_url
+                              if (not is_direct_host(s_url)) and link_recheck_due(ep_d, days=2, key="upgradeTriedAt"):
+                                  upgrade_eps.add(e_num)   # direct (hubcloud/pixeldrain) nahi hai -> badalne ki koshish
+                              else:
+                                  existing_season_eps[e_num] = s_url
                   except Exception:
                       pass
 
@@ -1019,8 +1101,19 @@ jobs:
 
                   # Primary site ke naye resolve hue links verify karo
                   for _ep in list(episodes_map.keys()):
-                      if _ep not in existing_season_eps and not is_link_alive(session, episodes_map[_ep], post_url):
-                          log(f"    [Ep {_ep:02d}] Primary link dead -> fallback try hoga.")
+                      if _ep in existing_season_eps:
+                          continue
+                      _st = link_status(session, episodes_map[_ep], post_url)
+                      if _st == "not_direct":
+                          _deep = extract_direct_link(session, episodes_map[_ep], post_url)
+                          if _deep and link_status(session, _deep, post_url) == "ok":
+                              log(f"    [Ep {_ep:02d}] Wrapper link -> direct link extracted.")
+                              episodes_map[_ep] = _deep
+                              continue
+                      if _st != "ok":
+                          log(f"    [Ep {_ep:02d}] Primary link {_st} -> fallback site try hoga.")
+                          if _st == "not_direct":
+                              wrapper_urls[_ep] = episodes_map[_ep]
                           episodes_map.pop(_ep)
 
                   expected_eps = set(raw_ep_map.keys())
@@ -1039,6 +1132,17 @@ jobs:
                       if fb_eps:
                           log(f"  [Fallback] Added {len(fb_eps)} episodes from AnimeDubHindi.")
 
+                  if os.environ.get("KEEP_WRAPPER_LINKS", "false").strip().lower() == "true":
+                      for _ep, _u in wrapper_urls.items():
+                          episodes_map.setdefault(_ep, _u)
+                  for _ep in sorted(upgrade_eps - set(episodes_map.keys())):
+                      _ref = existing_ep_refs.get(_ep)
+                      if _ref:
+                          try:
+                              _ref[0].update({"upgradeTriedAt": firestore.SERVER_TIMESTAMP})
+                              log(f"    [Ep {_ep:02d}] Direct link kahin nahi mila - purana link rakha (2 din baad dobara try).")
+                          except Exception:
+                              pass
                   for _ep in sorted(dead_eps - set(episodes_map.keys())):
                       _ref = existing_ep_refs.get(_ep)
                       if _ref:
