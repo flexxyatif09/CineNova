@@ -46,6 +46,7 @@ jobs:
           LINK_RECHECK_BUDGET: "80"
           DIRECT_HOSTS: "hubcloud,pixeldrain"
           KEEP_WRAPPER_LINKS: "false"
+          BLOCKED_LINK_HOSTS: "razorshell"
           PYTHONUNBUFFERED: "1"
         run: |
           python3 -u - << 'EOF'
@@ -695,8 +696,20 @@ jobs:
                   return False
               return bool(host) and any(h in host for h in DIRECT_HOSTS)
 
+          BLOCKED_LINK_HOSTS = tuple(h.strip().lower() for h in os.environ.get("BLOCKED_LINK_HOSTS", "razorshell").split(",") if h.strip())
+
+          def is_blocked_host(url: str) -> bool:
+              try:
+                  host = urlparse((url or "").strip()).netloc.lower()
+              except Exception:
+                  return False
+              return bool(host) and any(h in host for h in BLOCKED_LINK_HOSTS)
+
           def link_status(session, url: str, referer: str = "") -> str:
-              # "ok" = direct (hubcloud/pixeldrain) aur chal raha hai | "not_direct" = wrapper/unsupported | "dead"
+              # "ok" = direct (hubcloud/pixeldrain) aur chal raha hai | "blocked" = razorshell jaisa host (kabhi add nahi)
+              # | "not_direct" = wrapper/unsupported | "dead"
+              if is_blocked_host(url):
+                  return "blocked"
               if not is_direct_host(url):
                   return "not_direct"
               return "ok" if is_link_alive(session, url, referer) else "dead"
@@ -745,7 +758,7 @@ jobs:
           def extract_direct_link(session, url: str, referer: str = "", depth: int = 0, seen=None):
               # Wrapper/redirect page se hubcloud/pixeldrain ka direct link nikalta hai (max 3 hop)
               seen = seen if seen is not None else set()
-              if not url or url in seen or depth > 3:
+              if not url or url in seen or depth > 3 or is_blocked_host(url):
                   return None
               seen.add(url)
               if is_direct_host(url):
@@ -769,6 +782,8 @@ jobs:
               return None
 
           def resolve_fallback_link(session, href: str, referer: str):
+              if is_blocked_host(href):
+                  return None
               if is_direct_host(href):
                   return href
               got = resolve_codedew_to_hubcloud(session, href, referer)
@@ -1053,6 +1068,10 @@ jobs:
                                   frozen_dead.add(e_num)
                               continue
                           if s_url:
+                              if is_blocked_host(s_url):
+                                  log(f"    [Ep {e_num:02d}] Saved link is blocked host ({urlparse(s_url).netloc}) -> dusri site se replace hoga.")
+                                  dead_eps.add(e_num)
+                                  continue
                               if (not is_direct_host(s_url)) and link_recheck_due(ep_d, days=2, key="upgradeTriedAt"):
                                   upgrade_eps.add(e_num)   # direct (hubcloud/pixeldrain) nahi hai -> badalne ki koshish
                               else:
