@@ -81,17 +81,51 @@ jobs:
               "Chrome/126.0.0.0 Mobile Safari/537.36"
           )
 
-          # Blocklist: Anime/Cartoons to strictly EXCLUDE and never publish
+          # Blocklist: Tokusatsu / Power Rangers / Cartoons to strictly EXCLUDE (Only pure Anime allowed)
           BLOCKED_KEYWORDS = [
-              "tom and jerry",
-              "tom & jerry",
-              "tom jerry",
+              # Power Rangers / Tokusatsu / Live Action
+              "power ranger",
+              "power rangers",
+              "dino fury",
+              "cosmic fury",
+              "beast morphers",
+              "ninja steel",
+              "dino charge",
+              "megaforce",
+              "super megaforce",
+              "kamen rider",
+              "ryukendo",
+              "ultraman",
+              # Dragon Ball & Western Cartoons
               "dragon ball",
               "dragonball",
               "dragon ball z",
               "dragon ball super",
               "dragon ball gt",
               "dragon ball daima",
+              "tom and jerry",
+              "tom & jerry",
+              "tom jerry",
+              "ben 10",
+              "ben10",
+              "oggy",
+              "courage the cowardly dog",
+              "dexter's laboratory",
+              "dexters laboratory",
+              "adventure time",
+              "johnny test",
+              "horrid henry",
+              "supa strikas",
+              "teen titans",
+              "powerpuff",
+              "generator rex",
+              "jackie chan adventures",
+              "winx club",
+              "dc super hero",
+              "chhota bheem",
+              "motu patlu",
+              "bandbudh aur budbak",
+              "roll no 21",
           ]
 
           def is_title_blocked(text_or_url: str) -> bool:
@@ -381,11 +415,12 @@ jobs:
                   return None
 
           def collect_target_anime_urls(session, base_url: str):
-              log(f"Scanning anime feed across {base_url}/home/ pages...")
+              anime_cat_url = f"{base_url}/category/animes"
+              log(f"Scanning pure Anime category across {anime_cat_url}/ pages...")
               seen = set()
               collected = []
 
-              pages_to_check = [f"{base_url}/home/"] + [f"{base_url}/home/page/{i}/" for i in range(2, 10)]
+              pages_to_check = [f"{anime_cat_url}/"] + [f"{anime_cat_url}/page/{i}/" for i in range(2, 12)]
               for page_url in pages_to_check:
                   if len(collected) >= MAX_ANIME_PER_RUN:
                       break
@@ -415,6 +450,7 @@ jobs:
                                   "feed",
                                   "comments",
                                   "home",
+                                  "category",
                                   "contact",
                                   "privacy",
                                   "dmca",
@@ -430,7 +466,7 @@ jobs:
                   except Exception as e:
                       log(f"  [Warn] Error checking page {page_url}: {e}")
 
-              log(f"Total anime posts collected automatically: {len(collected)}")
+              log(f"Total pure anime posts collected automatically: {len(collected)}")
               return collected, seen
 
           def discover_all_seasons_for_series(session, base_url: str, clean_title: str, post_html: str, seen_urls: set):
