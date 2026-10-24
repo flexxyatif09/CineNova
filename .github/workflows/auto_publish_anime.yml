@@ -1,7 +1,7 @@
 name: CineNova Auto-Publish Anime Series & Movies
 
 on:
-  # Har 3 ghante me automatically naye anime episodes, seasons, anime movies check karega aur dead links fix karega (100% Free on GitHub Actions)
+  # Har 3 ghante me automatically chalega (100% Free on GitHub Actions)
   schedule:
     - cron: '0 */3 * * *'
   # GitHub Actions tab se 1-click manual run ke liye
@@ -12,7 +12,7 @@ on:
         required: false
         default: 'https://www.rareanimes.mov'
       max_items:
-        description: 'Kitne anime posts scrape karne hain (Default: 45, max: 120)'
+        description: 'Kitne anime posts scrape karne hain (Default: 45)'
         required: false
         default: '45'
 
@@ -35,51 +35,33 @@ jobs:
           pip install --upgrade pip
           pip install requests beautifulsoup4 cloudscraper firebase-admin lxml
 
-      - name: Scrape Anime Series (All Seasons/Episodes) & Anime Movies + Repair Dead Links
+      - name: Scrape Anime Series (All Seasons/Episodes) & Auto-Publish
         env:
           FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
           FIREBASE_DATABASE_ID: "ai-studio-android-devbuild-a9589065-5570-4074-a613-1c0430bf6841"
           ANIME_SITE_URL: ${{ github.event.inputs.site_url || 'https://www.rareanimes.mov' }}
           MAX_ANIME_PER_RUN: ${{ github.event.inputs.max_items || '45' }}
+          PYTHONUNBUFFERED: "1"
         run: |
-          python3 - << 'EOF'
+          python3 -u - << 'EOF'
           #!/usr/bin/env python3
-          """
-          CineNova Automated Anime Scraper, Multi-Server Liveness Verifier & Firestore Publisher
-          ======================================================================================
-          - Target Site: https://www.rareanimes.mov (RareToonsIndia / Rare Animes)
-          - Multi-Option Liveness Check (HubCloud + WatchMultQuality + DLBeta/PixelDrain):
-            * Tests each of the 3 options on the website for every episode.
-            * Verifies PixelDrain files via `/api/file/<ID>/info` (rejects 404 `not_found` expired files like Ameku M.D.).
-            * Supports `WatchMultQuality` (`codedew.com/multiquality/?url=<ID>` -> `argon.razorshell.space/downlead/<ID>/`)
-              and verifies via JuicyCodes `/api/videos/.../links` that real 360p/720p/1080p MP4 streams exist.
-            * Verifies HubCloud drive links (`hubcloud.../drive/...`) to confirm the download generator is live.
-            * Whichever option is working and alive is automatically saved to Firestore!
-          - Existing Database Health Audit & Auto-Repair:
-            * Audits all existing anime movies and episodes in Firestore in parallel (`ThreadPoolExecutor`).
-            * Any anime with a dead PixelDrain/HubCloud link in Firestore is flagged for immediate re-scraping
-              and automatically repaired with a working link from the website.
-          - Strict Language Priority:
-            * Hindi Dubbed links are always prioritized over Tamil/Telugu regional links.
-          """
-
-          from concurrent.futures import ThreadPoolExecutor
           import html
           import json
           import os
           import re
-          import socket
           import sys
+          import time
+          import warnings
           from urllib.parse import quote_plus, urljoin
 
-          # Force IPv4 (AF_INET) across all socket connections so Cloudflare (argon.razorshell.space)
-          # and origin stream servers (groovy.monster) always see the exact same client IP.
-          _orig_getaddrinfo = socket.getaddrinfo
+          # Suppress library warnings
+          warnings.filterwarnings("ignore")
 
-          def _ipv4_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
-              return _orig_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
-
-          socket.getaddrinfo = _ipv4_getaddrinfo
+          # Force instant unbuffered live output in GitHub Actions
+          if hasattr(sys.stdout, "reconfigure"):
+              sys.stdout.reconfigure(line_buffering=True)
+          if hasattr(sys.stderr, "reconfigure"):
+              sys.stderr.reconfigure(line_buffering=True)
 
           import firebase_admin
           from bs4 import BeautifulSoup
@@ -99,18 +81,32 @@ jobs:
               "Chrome/126.0.0.0 Mobile Safari/537.36"
           )
 
-          STREAM_LIVENESS_CACHE = {}
+          # Blocklist: Anime/Cartoons to strictly EXCLUDE and never publish
+          BLOCKED_KEYWORDS = [
+              "tom and jerry",
+              "tom & jerry",
+              "tom jerry",
+              "dragon ball",
+              "dragonball",
+              "dragon ball z",
+              "dragon ball super",
+              "dragon ball gt",
+              "dragon ball daima",
+          ]
 
+          def is_title_blocked(text_or_url: str) -> bool:
+              if not text_or_url:
+                  return False
+              norm = re.sub(r"[-_&.+:]+", " ", str(text_or_url).lower())
+              norm = re.sub(r"\s+", " ", norm).strip()
+              for kw in BLOCKED_KEYWORDS:
+                  kw_norm = re.sub(r"[-_&.+:]+", " ", kw.lower()).strip()
+                  if kw_norm and kw_norm in norm:
+                      return True
+              return False
 
-          def is_valid_anime_stream(url: str) -> bool:
-              u = (url or "").strip().lower()
-              return (
-                  "hubcloud" in u
-                  or "pixeldrain" in u
-                  or "razorshell.space/downlead/" in u
-                  or "multiquality/?url=" in u
-              )
-
+          def log(msg: str):
+              print(msg, flush=True)
 
           def create_http_session():
               try:
@@ -131,15 +127,14 @@ jobs:
               )
               return session
 
-
           def init_firestore_db():
               raw_service_account = os.environ.get("FIREBASE_SERVICE_ACCOUNT", "").strip()
               if not raw_service_account:
-                  print("ERROR: FIREBASE_SERVICE_ACCOUNT secret is empty! Add it in GitHub Settings -> Secrets.")
+                  log("ERROR: FIREBASE_SERVICE_ACCOUNT secret is empty! Add it in GitHub Settings -> Secrets.")
                   sys.exit(1)
 
               service_account_dict = json.loads(raw_service_account)
-              print(f"Authenticated with Firebase Project: {service_account_dict.get('project_id')}")
+              log(f"Authenticated with Firebase Project: {service_account_dict.get('project_id')}")
               cred = credentials.Certificate(service_account_dict)
               if not firebase_admin._apps:
                   firebase_admin.initialize_app(cred)
@@ -157,39 +152,33 @@ jobs:
                   try:
                       client = firestore.client(database_id=db_id)
                       list(client.collection("titles").limit(1).stream())
-                      print(f"Successfully connected to Firestore Database ID: '{db_id}'")
+                      log(f"Successfully connected to Firestore Database ID: '{db_id}'")
                       return client
                   except Exception as e:
-                      print(f"[Info] Database '{db_id}' not accessible ({e}), trying next...")
+                      log(f"[Info] Database '{db_id}' not accessible ({e}), trying next...")
 
               return firestore.client(database_id=FIREBASE_DATABASE_ID)
 
-
           def sanitize_anime_title(raw_title: str):
-              """Cleans up raw post title, removes unwanted parentheses, and extracts season & language."""
               text = html.unescape(re.sub(r"<[^>]+>", "", raw_title or "")).strip()
 
-              # Extract season number
               s_m = re.search(r"\b(?:Season|S)\s*0*(\d{1,2})\b", text, re.I)
               season_number = int(s_m.group(1)) if s_m else 1
 
-              # Extract release year if present
               y_m = re.search(r"\b((?:19|20)\d{2})\b", text)
               year = int(y_m.group(1)) if y_m else 2026
 
-              # Extract language
               language = "Hindi Dubbed"
-              if re.search(r"Dual\s*Audio|Multi\s*Audio|Tamil|Telugu", text, re.I):
+              if re.search(r"Dual\s*Audio|Multi\s*Audio| Tamil| Telugu", text, re.I):
                   language = "Multi Audio (Hindi)"
               elif re.search(r"Hindi\s*Sub", text, re.I):
                   language = "Japanese (Hindi Sub)"
 
-              # Clean display title
               clean = re.sub(r"[\(\[]\s*(?:19|20)\d{2}\s*[\)\]]", "", text, flags=re.I)
               clean = re.sub(r"[\(\[]\s*(?:Season|S)\s*\d+.*", "", clean, flags=re.I)
               clean = re.sub(r"\b(?:Season|S)\s*\d+.*", "", clean, flags=re.I)
               clean = re.sub(
-                  r"\b(?:Hindi\s*Dubbed|Hindi\s*Subbed|Hindi|Tamil|Telugu|Dual\s*Audio|Multi\s*Audio|Episodes?\s*Download|Download\s*HD|All\s*Episodes|Watch\s*Online|Watch\s*Download|Full\s*Movie\s*Download|Movie\s*Download|Download\s*480p.*|Download\s*720p.*|Download\s*1080p.*|BluRay.*|WEB-DL.*|HD\s*Download.*)\b.*",
+                  r"\b(?:Hindi\s*Dubbed|Hindi\s*Subbed|Hindi|Tamil|Telugu|Dual\s*Audio|Multi\s*Audio|Episodes?\s*Download|Download\s*HD|All\s*Episodes|Watch\s*Download|Download\s*480p.*)\b.*",
                   "",
                   clean,
                   flags=re.I,
@@ -206,271 +195,35 @@ jobs:
               display_title = clean or text[:60].strip()
               return display_title, season_number, language, year
 
-
           def is_anime_movie_post(raw_title: str, post_html: str, post_url: str, raw_ep_map: dict) -> bool:
-              """
-              Determines whether an anime post is a standalone Anime Movie (`type: "movie"`)
-              or an episode-wise Anime Series (`type: "series"`).
-              """
               if len(raw_ep_map) > 1:
                   return False
-
               text = html.unescape(raw_title or "")
               url_lower = (post_url or "").lower()
-
               has_season_tag = bool(re.search(r"\b(?:Season|S)\s*0*\d+\b", text, re.I)) or bool(
                   re.search(r"season-\d+", url_lower)
               )
               has_episodes_word = bool(re.search(r"\bEpisodes?\b", text, re.I)) or "episodes" in url_lower
               has_ep_headings = len(re.findall(r"Episode\s*0*\d+", post_html, flags=re.I)) >= 2
-
               if has_season_tag or has_episodes_word or has_ep_headings:
                   return False
-
               if re.search(r"\b(?:Movie|Film)\b", text, re.I) or "/movies/" in url_lower or "-movie-" in url_lower:
                   return True
-
               if not re.search(r"Episode\s*0*1\b", post_html, flags=re.I) and len(raw_ep_map) == 1:
                   return True
-
               return False
 
-
-          def normalize_pixeldrain_url(raw_target: str) -> str:
-              """Converts `/watchbeta/?url=ID` or `pixeldrain.*/u/ID` into direct binary API stream URL (`/api/file/ID`)."""
-              m_wb = re.search(r"watchbeta/\?url=([A-Za-z0-9_-]+)", raw_target, re.I)
-              if m_wb:
-                  return f"https://pixeldrain.net/api/file/{m_wb.group(1)}"
-
-              m_pd = re.search(r"pixeldrain\.[a-z]+/(?:u|api/file)/([A-Za-z0-9_-]+)", raw_target, re.I)
-              if m_pd:
-                  return f"https://pixeldrain.net/api/file/{m_pd.group(1)}"
-
-              return ""
-
-
-          def normalize_multiquality_url(raw_target: str) -> str:
-              """
-              Converts `codedew.com/multiquality/?url=ID`, `codedew.com/cdn/ziptron.php/?ID`,
-              `argon.razorshell.space/embed/ID`, or `argon.razorshell.space/downlead/ID/`
-              into the canonical JuicyCodes MultiQuality download page URL:
-              `https://argon.razorshell.space/downlead/ID/`
-              """
-              m_mq = re.search(
-                  r"(?:multiquality/\?url=|ziptron\.php/\?|razorshell\.space/(?:embed|downlead)/)([A-Za-z0-9_-]+)",
-                  raw_target,
-                  re.I,
-              )
-              if m_mq:
-                  return f"https://argon.razorshell.space/downlead/{m_mq.group(1)}/"
-              return ""
-
-
-          def is_stream_alive(session, stream_url: str, verify_multiquality_api: bool = False) -> bool:
-              """
-              Verifies that a resolved stream URL (`HubCloud`, `PixelDrain`, or `WatchMultQuality`)
-              actually exists on the remote server and is not a 404/deleted file.
-              """
-              u = (stream_url or "").strip()
-              if not u or not is_valid_anime_stream(u):
-                  return False
-
-              cache_key = f"{u}_{verify_multiquality_api}"
-              if cache_key in STREAM_LIVENESS_CACHE:
-                  return STREAM_LIVENESS_CACHE[cache_key]
-
-              alive = False
+          def resolve_codedew_to_hubcloud(session, codedew_url: str, post_url: str = ""):
               try:
-                  u_lower = u.lower()
-                  if "pixeldrain" in u_lower:
-                      pd_norm = normalize_pixeldrain_url(u)
-                      m_id = re.search(r"/api/file/([A-Za-z0-9_-]+)", pd_norm)
-                      if m_id:
-                          fid = m_id.group(1)
-                          info_url = f"https://pixeldrain.net/api/file/{fid}/info"
-                          r = session.get(info_url, timeout=10)
-                          if r.status_code == 200:
-                              data = r.json()
-                              fname = str(data.get("name", "")).lower()
-                              is_regional_only = (
-                                  any(lang in fname for lang in ("telugu", "tamil", "kannada", "malayalam"))
-                                  and "hindi" not in fname
-                                  and "multi" not in fname
-                              )
-                              alive = (
-                                  bool(data.get("success", True))
-                                  and int(data.get("size", 0)) > 0
-                                  and not is_regional_only
-                              )
-                  elif "razorshell.space/downlead/" in u_lower or "multiquality/?url=" in u_lower:
-                      mq_url = normalize_multiquality_url(u) or u
-                      r1 = session.get(
-                          mq_url,
-                          headers={
-                              "User-Agent": USER_AGENT,
-                              "Accept-Language": "en-US,en;q=0.9",
-                              "Referer": "https://codedew.com/",
-                          },
-                          timeout=12,
-                      )
-                      if r1.status_code == 200 and "window.juicyData" in r1.text:
-                          if verify_multiquality_api:
-                              m_jd = re.search(r"window\.juicyData\s*=\s*(\{.*?\})\s*</script>", r1.text, re.S)
-                              if m_jd:
-                                  jd = json.loads(m_jd.group(1)).get("data", {})
-                                  links_route = jd.get("routes", {}).get("links", "")
-                                  token = jd.get("token", "")
-                                  if links_route and token:
-                                      r2 = session.post(
-                                          f"https://argon.razorshell.space{links_route}",
-                                          json={"captcha": None, "_token": token},
-                                          headers={
-                                              "User-Agent": USER_AGENT,
-                                              "Accept-Language": "en-US,en;q=0.9",
-                                              "Accept": "application/json",
-                                              "Content-Type": "application/json",
-                                              "Origin": "https://argon.razorshell.space",
-                                              "Referer": mq_url,
-                                          },
-                                          timeout=12,
-                                      )
-                                      if r2.status_code == 200:
-                                          res_json = r2.json()
-                                          alive = bool(res_json.get("success")) and len(res_json.get("qualities", [])) > 0
-                          else:
-                              alive = "DOWNLOAD:" in r1.text and "routes" in r1.text
-                  elif "hubcloud" in u_lower:
-                      r = session.get(u, timeout=12)
-                      if r.status_code == 200:
-                          body = r.text
-                          body_lower = body.lower()
-                          title_m = re.search(r"<title>(.*?)</title>", body, re.I | re.S)
-                          title_lower = (title_m.group(1) if title_m else "").lower()
-                          is_regional_only = (
-                              any(lang in title_lower for lang in ("telugu", "tamil", "kannada", "malayalam"))
-                              and "hindi" not in title_lower
-                              and "multi" not in title_lower
-                          )
-                          has_dl = (
-                              'id="download"' in body_lower
-                              or "id='download'" in body_lower
-                              or "generate direct" in body_lower
-                              or "hubcloud.php" in body_lower
-                              or "gamerxyt" in body_lower
-                              or "fsl" in body_lower
-                          )
-                          not_dead = "file not found" not in body_lower and "404 not found" not in body_lower
-                          alive = has_dl and not_dead and not is_regional_only
-              except Exception:
-                  alive = False
-
-              STREAM_LIVENESS_CACHE[cache_key] = alive
-              return alive
-
-
-          def upgrade_hubcloud_if_no_fsl(session, hub_url: str) -> str:
-              """
-              Inspects a HubCloud drive URL (`https://hubcloud.../drive/...`):
-              - Rejects regional [Telugu] / [Tamil] HubCloud files (returns "").
-              - If the HubCloud generator page (`gamerxyt.com/hubcloud.php`) has NO `[FSL Server]` button,
-                extracts the real JavaScript `var pxl = "https://pixeldrain.dev/u/<ID>"` link (bypassing the
-                fake `negn6f` DMCA decoy in `<a id="pxl-1">`) and returns `https://pixeldrain.net/api/file/<ID>`
-                if alive!
-              """
-              try:
-                  r = session.get(hub_url, timeout=12)
-                  if not r.ok:
-                      return ""
-                  body = r.text
-                  title_m = re.search(r"<title>(.*?)</title>", body, re.I | re.S)
-                  title_lower = (title_m.group(1) if title_m else "").lower()
-                  if (
-                      any(lang in title_lower for lang in ("telugu", "tamil", "kannada", "malayalam"))
-                      and "hindi" not in title_lower
-                      and "multi" not in title_lower
-                  ):
-                      print(f"  [Skip Regional HubCloud] {title_lower.strip()}")
-                      return ""
-
-                  gen_m = re.findall(
-                      r"href=[\x27\"](https?://[^\x27\"]*(?:gamerxyt|hubcloud\.php|carnewz|cryptoinsights)[^\x27\"]*)[\x27\"]",
-                      body,
-                      re.I,
-                  )
-                  if not gen_m:
-                      return hub_url
-
-                  rg = session.get(html.unescape(gen_m[0]), headers={"Referer": hub_url}, timeout=12)
-                  if not rg.ok:
-                      return hub_url
-                  gen_html = rg.text
-
-                  # Check if an active (uncommented) FSL Server button exists
-                  clean_gen = re.sub(r"<!--[\s\S]*?-->", "", gen_html)
-                  if re.search(r"Download\s*\[[^\]]*FSL", clean_gen, re.I):
-                      return hub_url
-
-                  # No FSL Server button on HubCloud! Check for JS `var pxl = "https://pixeldrain.dev/u/<ID>"`
-                  pxl_m = re.search(
-                      r"var\s+pxl\s*=\s*[\x27\"](https?://[^\x27\"]*pixeldrain\.[a-z]+/(?:u|api/file)/([A-Za-z0-9_-]+))[\x27\"]",
-                      gen_html,
-                      re.I,
-                  )
-                  if pxl_m:
-                      pd_url = f"https://pixeldrain.net/api/file/{pxl_m.group(2)}"
-                      if is_stream_alive(session, pd_url):
-                          return pd_url
-              except Exception:
-                  pass
-              return hub_url
-
-
-          def resolve_codedew_to_stream(session, codedew_url: str, post_url: str = ""):
-              """
-              Bypasses codedew.com shortener in 1-2 fast GET requests to extract:
-                1. Real HubCloud drive URL (`https://hubcloud.../drive/...`, or upgraded to direct PixelDrain if no FSL button), OR
-                2. Direct PixelDrain 206 stream URL from `[DLBeta]` (`/watchbeta/?url=ID` -> `https://pixeldrain.net/api/file/ID`), OR
-                3. MultiQuality / JuicyCodes download page URL from `[WatchMultQuality]`
-                   (`/multiquality/?url=ID` -> `https://argon.razorshell.space/downlead/ID/`)
-              """
-              try:
-                  direct_pd = normalize_pixeldrain_url(codedew_url)
-                  if direct_pd:
-                      return direct_pd
-                  direct_mq = normalize_multiquality_url(codedew_url)
-                  if direct_mq:
-                      return direct_mq
-                  if "hubcloud" in codedew_url.lower():
-                      return upgrade_hubcloud_if_no_fsl(session, codedew_url) or None
-
                   req_headers = {"Referer": post_url or f"{DEFAULT_SITE_URL}/"}
-                  r1 = session.get(codedew_url, headers=req_headers, timeout=12)
+                  r1 = session.get(codedew_url, headers=req_headers, timeout=10)
                   if not r1.ok:
                       return None
 
-                  # Check if r1 already redirected directly to multiquality, watchbeta, pixeldrain, or hubcloud
-                  if "hubcloud" in r1.url.lower():
-                      return upgrade_hubcloud_if_no_fsl(session, r1.url) or None
-                  pd_r1_url = normalize_pixeldrain_url(r1.url)
-                  if pd_r1_url:
-                      return pd_r1_url
-                  mq_r1_url = normalize_multiquality_url(r1.url)
-                  if mq_r1_url:
-                      return mq_r1_url
-
                   h1 = r1.text
-
                   direct_hub = re.findall(r"href=[\x27\"](https?://[^/]*hubcloud[^\x27\"]+)[\x27\"]", h1, re.I)
                   if direct_hub:
-                      return upgrade_hubcloud_if_no_fsl(session, html.unescape(direct_hub[0])) or None
-
-                  pd1 = normalize_pixeldrain_url(h1)
-                  if pd1:
-                      return pd1
-
-                  mq1 = normalize_multiquality_url(h1)
-                  if mq1:
-                      return mq1
+                      return html.unescape(direct_hub[0])
 
                   step1_links = re.findall(r"data-href=[\x27\"]([^\x27\"]+)[\x27\"]", h1)
                   if not step1_links:
@@ -479,56 +232,30 @@ jobs:
                       return None
 
                   step2_url = urljoin(codedew_url, html.unescape(step1_links[0]))
-                  r2 = session.get(step2_url, headers={"Referer": codedew_url}, timeout=12)
+                  r2 = session.get(step2_url, headers={"Referer": codedew_url}, timeout=10)
                   if not r2.ok:
                       return None
-
-                  if "hubcloud" in r2.url.lower():
-                      return upgrade_hubcloud_if_no_fsl(session, r2.url) or None
-                  pd_r2_url = normalize_pixeldrain_url(r2.url)
-                  if pd_r2_url:
-                      return pd_r2_url
-                  mq_r2_url = normalize_multiquality_url(r2.url)
-                  if mq_r2_url:
-                      return mq_r2_url
 
                   h2 = r2.text
                   step2_links = re.findall(r"data-href=[\x27\"]([^\x27\"]+)[\x27\"]", h2)
                   for candidate in step2_links:
                       target = html.unescape(candidate)
                       if "hubcloud" in target.lower():
-                          return upgrade_hubcloud_if_no_fsl(session, target) or None
-                      pd_target = normalize_pixeldrain_url(target)
-                      if pd_target:
-                          return pd_target
-                      mq_target = normalize_multiquality_url(target)
-                      if mq_target:
-                          return mq_target
+                          return target
 
                   direct_hub2 = re.findall(r"href=[\x27\"](https?://[^/]*hubcloud[^\x27\"]+)[\x27\"]", h2, re.I)
                   if direct_hub2:
-                      return upgrade_hubcloud_if_no_fsl(session, html.unescape(direct_hub2[0])) or None
-
-                  pd2 = normalize_pixeldrain_url(h2)
-                  if pd2:
-                      return pd2
-
-                  mq2 = normalize_multiquality_url(h2)
-                  if mq2:
-                      return mq2
+                      return html.unescape(direct_hub2[0])
               except Exception as e:
-                  print(f"  [Warn] Failed resolving codedew link {codedew_url[:60]}: {e}")
+                  log(f"  [Warn] Failed resolving codedew link {codedew_url[:50]}: {e}")
 
               return None
 
-
-          def extract_raw_episode_map(post_html: str):
+          def extract_raw_hubcloud_episode_map(post_html: str):
               """
-              Pure in-memory regex parser: extracts ({episode_number: [codedew_urls]}, {episode_number: episode_title})
-              Includes all 3 server options on the site ([HubCloud], [WatchMultQuality], [DLBeta] / [PixelDrain]).
-              - STRICTLY EXCLUDES 'Untouched CR' / 'Untouched' 1GB+ files.
+              Pure in-memory regex parser: extracts ({ep_num: [urls]}, {ep_num: title})
+              - STRICTLY EXCLUDES 'Untouched CR' / 'Untouched' 1GB+ uncompressed links.
               - Extracts real episode name from post text (e.g. 'Episode 01 – The Future Is in Our Hands').
-              - Strictly selects ONLY Hindi Dubbed links whenever Hindi is present (never falling back to Tamil/Telugu).
               """
               episodes_raw = {}
               episodes_titles = {}
@@ -551,196 +278,83 @@ jobs:
                   else:
                       if not found_any_ep_heading and len(blocks) > 1:
                           continue
+
                       sub_units = re.findall(r"<p[^>]*>.*?</p>|<div[^>]*>.*?</div>|[^<\n]+", block, re.S)
                       if not sub_units:
                           sub_units = [block]
 
-                      hindi_hub = []
-                      hindi_multiquality = []
-                      hindi_dlbeta = []
-                      hindi_other = []
-
-                      default_hub = []
-                      default_multiquality = []
-                      default_dlbeta = []
-                      default_other = []
-
-                      regional_hub = []
-                      regional_multiquality = []
-                      regional_dlbeta = []
-                      regional_other = []
-
                       for unit in sub_units:
                           unit_text = re.sub(r"<[^>]+>", " ", unit).lower()
-
-                          # CRITICAL: STRICTLY SKIP ANY UNTOUCHED CR UNITS (1GB+ UNCOMPRESSED CR FILES)
+                          # CRITICAL: STRICTLY EXCLUDE UNTOUCHED CR LINKS (1GB+ FILES)
                           if "untouched" in unit_text:
                               continue
 
-                          unit_a_tags = re.findall(
-                              r"<a\s+[^>]*href=[\x27\"](https?://(?:codedew\.com|[^/]*hubcloud|[^/]*pixeldrain|[^/]*razorshell)[^\x27\"]+)[\x27\"][^>]*>((?:(?!</a>)[\s\S])*)</a>",
+                          a_tags = re.findall(
+                              r"<a\s+[^>]*href=[\x27\"](https?://codedew\.com/[^\x27\"]+)[\x27\"][^>]*>((?:(?!</a>)[\s\S])*)</a>",
                               unit,
                               re.I,
                           )
-                          if not unit_a_tags:
-                              continue
+                          hub_links = [
+                              href
+                              for href, inner in a_tags
+                              if "hubcloud" in re.sub(r"<[^>]+>", "", inner).lower()
+                              and "untouched" not in re.sub(r"<[^>]+>", "", inner).lower()
+                              and "untouched" not in href.lower()
+                          ]
+                          if hub_links:
+                              episodes_raw.setdefault(current_ep, []).extend(hub_links)
 
-                          is_hindi = "hindi" in unit_text
-                          is_regional = any(
-                              lang in unit_text
-                              for lang in ("tamil", "telugu", "kannada", "malayalam", "bengali", "marathi")
-                          )
-
-                          for href, inner in unit_a_tags:
-                              label = re.sub(r"<[^>]+>", "", inner).strip().lower()
-
-                              # Do not take any untouched link if labeled in href/anchor
-                              if "untouched" in label or "untouched" in href.lower():
-                                  continue
-
-                              is_hub = "hubcloud" in label or "hubcloud" in href.lower()
-                              is_multiquality = (
-                                  "multquality" in label
-                                  or "multiquality" in label
-                                  or "multiquality" in href.lower()
-                              )
-                              is_dlbeta = any(
-                                  k in label for k in ("dlbeta", "pixeldrain", "direct", "gdrive", "download", "watchbeta")
-                              )
-                              # Skip Mega links since Mega requires proprietary browser decryption
-                              if "mega" in label and not is_hub and not is_multiquality and not is_dlbeta:
-                                  continue
-
-                              if is_hindi:
-                                  if is_hub:
-                                      hindi_hub.append(href)
-                                  elif is_multiquality:
-                                      hindi_multiquality.append(href)
-                                  elif is_dlbeta:
-                                      hindi_dlbeta.append(href)
-                                  else:
-                                      hindi_other.append(href)
-                              elif is_regional:
-                                  if is_hub:
-                                      regional_hub.append(href)
-                                  elif is_multiquality:
-                                      regional_multiquality.append(href)
-                                  elif is_dlbeta:
-                                      regional_dlbeta.append(href)
-                                  else:
-                                      regional_other.append(href)
-                              else:
-                                  if is_hub:
-                                      default_hub.append(href)
-                                  elif is_multiquality:
-                                      default_multiquality.append(href)
-                                  elif is_dlbeta:
-                                      default_dlbeta.append(href)
-                                  else:
-                                      default_other.append(href)
-
-                      hindi_candidates = hindi_hub + hindi_dlbeta + hindi_multiquality + hindi_other
-                      default_candidates = default_hub + default_dlbeta + default_multiquality + default_other
-                      regional_candidates = regional_hub + regional_dlbeta + regional_multiquality + regional_other
-
-                      # Strictly exclude Tamil/Telugu regional links whenever Hindi links are present on the episode!
-                      if hindi_candidates:
-                          ordered_candidates = hindi_candidates + default_candidates
-                      elif default_candidates:
-                          ordered_candidates = default_candidates
-                      else:
-                          ordered_candidates = regional_candidates
-
-                      if ordered_candidates:
-                          episodes_raw.setdefault(current_ep, []).extend(ordered_candidates)
-
-              # Single Anime Movie fallback (when page has download links without "Episode 01" headings)
+              # Single Anime Movie fallback
               if not episodes_raw:
                   a_tags = re.findall(
-                      r"<a\s+[^>]*href=[\x27\"](https?://(?:codedew\.com|[^/]*hubcloud|[^/]*pixeldrain|[^/]*razorshell)[^\x27\"]+)[\x27\"][^>]*>((?:(?!</a>)[\s\S])*)</a>",
+                      r"<a\s+[^>]*href=[\x27\"](https?://codedew\.com/[^\x27\"]+)[\x27\"][^>]*>((?:(?!</a>)[\s\S])*)</a>",
                       post_html,
                       re.I,
                   )
-                  hub_links = []
-                  mq_links = []
-                  dlbeta_links = []
-                  for href, inner in a_tags:
-                      label = re.sub(r"<[^>]+>", "", inner).strip().lower()
-                      if "untouched" in label or "untouched" in href.lower():
-                          continue
-                      if "hubcloud" in label or "hubcloud" in href.lower():
-                          hub_links.append(href)
-                      elif "multquality" in label or "multiquality" in label or "multiquality" in href.lower():
-                          mq_links.append(href)
-                      elif any(k in label for k in ("dlbeta", "pixeldrain", "direct", "watchbeta")):
-                          dlbeta_links.append(href)
-                  combined = hub_links + mq_links + dlbeta_links
-                  if combined:
-                      episodes_raw[1] = combined
+                  hub_links = [
+                      href
+                      for href, inner in a_tags
+                      if "hubcloud" in re.sub(r"<[^>]+>", "", inner).lower()
+                      and "untouched" not in re.sub(r"<[^>]+>", "", inner).lower()
+                      and "untouched" not in href.lower()
+                  ]
+                  if hub_links:
+                      episodes_raw[1] = hub_links
 
               return episodes_raw, episodes_titles
 
-
           def resolve_anime_episodes(session, raw_ep_map: dict, existing_season_eps: dict, post_url: str):
-              """
-              Resolves codedew -> HubCloud / WatchMultQuality / PixelDrain links for each episode in raw_ep_map.
-              Verifies every candidate option with `is_stream_alive` so dead links (e.g. 404 PixelDrain files)
-              are automatically skipped and replaced with the working option (e.g. WatchMultQuality or HubCloud)!
-              """
               resolved_episodes = {}
-              missing_eps = []
-              verified_mq_api_once = False
-              print(f"Found {len(raw_ep_map)} episode entries on page.")
+              log(f"  => Found {len(raw_ep_map)} episodes on page.")
 
               for ep_num in sorted(raw_ep_map.keys()):
-                  if ep_num in existing_season_eps and is_stream_alive(session, existing_season_eps[ep_num]):
+                  if ep_num in existing_season_eps and "hubcloud" in existing_season_eps[ep_num].lower():
                       resolved_episodes[ep_num] = existing_season_eps[ep_num]
-                      print(f"  [Ep {ep_num:02d}] Verified existing working stream -> {existing_season_eps[ep_num]}")
+                      log(f"    [Ep {ep_num:02d}] Already in database -> {existing_season_eps[ep_num][:45]}...")
                       continue
 
                   candidates = raw_ep_map[ep_num]
-                  resolved_stream = None
+                  real_hubcloud = None
                   seen_c = set()
-
-                  for codedew_link in candidates:
+                  for codedew_link in reversed(candidates):
                       if codedew_link in seen_c:
                           continue
                       seen_c.add(codedew_link)
-                      candidate_stream = resolve_codedew_to_stream(session, codedew_link, post_url)
-                      if not candidate_stream or not is_valid_anime_stream(candidate_stream):
-                          continue
-
-                      need_mq_api = ("razorshell.space/downlead/" in candidate_stream.lower()) and not verified_mq_api_once
-                      if is_stream_alive(session, candidate_stream, verify_multiquality_api=need_mq_api):
-                          if "razorshell.space/downlead/" in candidate_stream.lower():
-                              verified_mq_api_once = True
-                          resolved_stream = candidate_stream
+                      real_hubcloud = resolve_codedew_to_hubcloud(session, codedew_link, post_url)
+                      if real_hubcloud and "hubcloud" in real_hubcloud.lower():
                           break
-                      else:
-                          print(f"  [Ep {ep_num:02d}] Dead/expired option skipped ({candidate_stream}), trying next option...")
 
-                  if resolved_stream:
-                      resolved_episodes[ep_num] = resolved_stream
-                      print(f"  [Ep {ep_num:02d}] Resolved Working Stream -> {resolved_stream}")
+                  if real_hubcloud and "hubcloud" in real_hubcloud.lower():
+                      resolved_episodes[ep_num] = real_hubcloud
+                      log(f"    [Ep {ep_num:02d}] Resolved HubCloud -> {real_hubcloud}")
                   else:
-                      missing_eps.append(ep_num)
-                      print(f"  [Ep {ep_num:02d}] All options unavailable, queued for season continuity fallback.")
-
-              # Fill any single gap episode (such as Ep 25 in Black Clover S1) if other episodes in the season resolved
-              if missing_eps and resolved_episodes:
-                  sorted_valid_eps = sorted(resolved_episodes.keys())
-                  for m_ep in missing_eps:
-                      nearest_ep = min(sorted_valid_eps, key=lambda x: abs(x - m_ep))
-                      resolved_episodes[m_ep] = resolved_episodes[nearest_ep]
-                      print(f"  [Ep {m_ep:02d}] Preserved in season list using nearest working stream (Ep {nearest_ep:02d}).")
+                      log(f"    [Ep {ep_num:02d}] Link pending on website, skipped.")
 
               return resolved_episodes
 
-
           def fetch_anime_post_details(session, post_url: str):
-              """Fetches full post HTML and extracts metadata."""
               try:
-                  r = session.get(post_url, timeout=15)
+                  r = session.get(post_url, timeout=12)
                   if not r.ok:
                       return None
                   html_text = r.text
@@ -763,55 +377,71 @@ jobs:
                       "synopsis": synopsis,
                   }
               except Exception as e:
-                  print(f"[Error] Failed fetching anime post {post_url}: {e}")
+                  log(f"  [Warn] Failed fetching post {post_url}: {e}")
                   return None
 
+          def collect_target_anime_urls(session, base_url: str):
+              log(f"Scanning anime feed across {base_url}/home/ pages...")
+              seen = set()
+              collected = []
 
-          def is_blocked_url(clean_url: str) -> bool:
-              return any(
-                  k in clean_url
-                  for k in (
-                      "all-anime-cartoon",
-                      "wp-content",
-                      "wp-json",
-                      "feed",
-                      "comments",
-                      "/home/",
-                      "contact",
-                      "privacy",
-                      "dmca",
-                      "disclaimer",
-                      "about",
-                      "/category/",
-                      "/tag/",
-                      "/page/",
-                  )
-              )
+              pages_to_check = [f"{base_url}/home/"] + [f"{base_url}/home/page/{i}/" for i in range(2, 10)]
+              for page_url in pages_to_check:
+                  if len(collected) >= MAX_ANIME_PER_RUN:
+                      break
+                  try:
+                      r = session.get(page_url, timeout=12)
+                      if not r.ok:
+                          continue
 
+                      articles = re.findall(r"<article[\s\S]*?</article>", r.text, re.I)
+                      for art in articles:
+                          m = re.search(
+                              r"href=[\x27\"](https?://(?:www\.)?rareanimes\.mov/[^\x27\"#?]+)[\x27\"]",
+                              art,
+                              re.I,
+                          )
+                          if not m:
+                              continue
+                          clean_url = m.group(1).split("?")[0].rstrip("/") + "/"
+                          if clean_url in seen or is_title_blocked(clean_url):
+                              continue
+                          if any(
+                              k in clean_url
+                              for k in (
+                                  "all-anime-cartoon",
+                                  "wp-content",
+                                  "wp-json",
+                                  "feed",
+                                  "comments",
+                                  "home",
+                                  "contact",
+                                  "privacy",
+                                  "dmca",
+                                  "disclaimer",
+                                  "about",
+                              )
+                          ):
+                              continue
+                          seen.add(clean_url)
+                          collected.append(clean_url)
+                          if len(collected) >= MAX_ANIME_PER_RUN:
+                              break
+                  except Exception as e:
+                      log(f"  [Warn] Error checking page {page_url}: {e}")
 
-          def extract_article_urls_from_html(html_text: str):
-              urls = []
-              articles = re.findall(r"<article[\s\S]*?</article>", html_text, re.I)
-              for art in articles:
-                  m = re.search(
-                      r"href=[\x27\"](https?://(?:www\.)?rareanimes\.mov/[^\x27\"#?]+)[\x27\"]",
-                      art,
-                      re.I,
-                  )
-                  if not m:
-                      continue
-                  clean_url = m.group(1).split("?")[0].rstrip("/") + "/"
-                  if not is_blocked_url(clean_url):
-                      urls.append(clean_url)
-              return urls
-
+              log(f"Total anime posts collected automatically: {len(collected)}")
+              return collected, seen
 
           def discover_all_seasons_for_series(session, base_url: str, clean_title: str, post_html: str, seen_urls: set):
               """
-              Discovers ALL seasons of a series:
-              1. Scans post_html directly for companion season URLs (e.g. naruto-shippuden-season-01..17).
-              2. Queries WordPress search `rareanimes.mov/?s=<clean_title>` with pagination across pages 1..3.
+              Discovers ALL companion seasons:
+              1. Scans direct links from post HTML (e.g. naruto-shippuden-season-01..17).
+              2. Queries WordPress search with pagination (pages 1..3).
               """
+              if is_title_blocked(clean_title):
+                  return []
+
               discovered = []
               clean_slug = re.sub(r"[^a-z0-9]+", "-", clean_title.lower()).strip("-")
 
@@ -824,7 +454,7 @@ jobs:
                   )
                   for dl in direct_links:
                       clean_u = dl.split("?")[0].rstrip("/") + "/"
-                      if clean_u in seen_urls or is_blocked_url(clean_u):
+                      if clean_u in seen_urls or is_title_blocked(clean_u):
                           continue
                       if (clean_slug in clean_u.lower() or "season" in clean_u.lower()) and re.search(r"season[-_]?0*\d+", clean_u, re.I):
                           seen_urls.add(clean_u)
@@ -835,296 +465,129 @@ jobs:
               for p in range(1, 4):
                   search_url = f"{base_url}/?s={query}" if p == 1 else f"{base_url}/page/{p}/?s={query}"
                   try:
-                      r = session.get(search_url, timeout=12)
+                      r = session.get(search_url, timeout=10)
                       if not r.ok:
                           continue
-                      for u in extract_article_urls_from_html(r.text):
-                          if u not in seen_urls:
-                              seen_urls.add(u)
-                              discovered.append(u)
+                      articles = re.findall(r"<article[\s\S]*?</article>", r.text, re.I)
+                      for art in articles:
+                          m = re.search(
+                              r"href=[\x27\"](https?://(?:www\.)?rareanimes\.mov/[^\x27\"#?]+)[\x27\"]",
+                              art,
+                              re.I,
+                          )
+                          if not m:
+                              continue
+                          clean_url = m.group(1).split("?")[0].rstrip("/") + "/"
+                          if clean_url in seen_urls or is_title_blocked(clean_url):
+                              continue
+                          seen_urls.add(clean_url)
+                          discovered.append(clean_url)
                   except Exception:
                       break
 
               return discovered
 
-
-          def collect_target_anime_urls(session, base_url: str, existing_anime: dict):
-              """
-              1. Scrapes anime <article> post cards across /home/, /home/page/2..12, and /category/movies/
-              2. Searches `/?s=<title>` for any existing anime in Firestore that has dead/expired links
-                 (`needs_repair: True`), missing seasons, or incomplete episode counts!
-              """
-              print(f"Scanning anime <article> feed across {base_url}/home/ and /category/movies/...")
-              seen = set()
-              collected = []
-
-              feed_pages = (
-                  [f"{base_url}/home/"]
-                  + [f"{base_url}/home/page/{i}/" for i in range(2, 13)]
-                  + [f"{base_url}/category/movies/", f"{base_url}/category/movies/page/2/"]
-              )
-
-              for page_url in feed_pages:
-                  if len(collected) >= MAX_ANIME_PER_RUN:
-                      break
-                  try:
-                      r = session.get(page_url, timeout=15)
-                      if not r.ok:
-                          continue
-                      for clean_url in extract_article_urls_from_html(r.text):
-                          if clean_url in seen:
-                              continue
-                          seen.add(clean_url)
-                          collected.append(clean_url)
-                          if len(collected) >= MAX_ANIME_PER_RUN:
-                              break
-                  except Exception as e:
-                      print(f"[Warn] Error checking page {page_url}: {e}")
-
-              # Prioritize repairing any existing Firestore anime that had dead links (e.g. expired PixelDrain) or missing seasons
-              for doc_id, info in list(existing_anime.items()):
-                  title_str = info.get("title", "").strip()
-                  if not title_str:
-                      continue
-                  seasons_eps = info.get("seasons_eps", {})
-                  season_count = info.get("seasonCount", 1)
-                  needs_repair = bool(info.get("needs_repair", False))
-                  has_missing_season = season_count > len(seasons_eps) or (
-                      seasons_eps and set(seasons_eps.keys()) != set(range(1, max(seasons_eps.keys()) + 1))
-                  )
-                  has_partial_s1 = 1 in seasons_eps and len(seasons_eps[1]) == 20
-                  if needs_repair or has_missing_season or has_partial_s1:
-                      reason = "Dead Link Repair" if needs_repair else "Season Discovery"
-                      print(f"  [{reason}] Searching posts on site for existing anime: '{title_str}'...")
-                      extra_urls = discover_all_seasons_for_series(session, base_url, title_str, "", seen)
-                      for eu in reversed(extra_urls):
-                          collected.insert(0, eu)
-
-              print(f"Total anime article posts queued: {len(collected)}")
-              return collected, seen
-
-
-          def load_and_clean_existing_anime(session, titles_ref):
-              """
-              Loads existing anime from Firestore, verifies live stream health across all episodes/movies,
-              and flags any anime with dead/expired links (e.g. 404 PixelDrain files) so they are automatically
-              re-scraped and repaired with working WatchMultQuality / HubCloud links!
-              """
-              print("Auditing existing anime in Firestore & checking stream liveness...")
+          def load_fast_existing_anime(titles_ref):
+              log("Checking existing anime database...")
               existing_anime = {}
-              repaired_queue_count = 0
-
               try:
-                  anime_docs = []
                   for doc in titles_ref.stream():
                       d = doc.to_dict() or {}
-                      g = d.get("genres", [])
-                      if "Anime" in g or "Animation" in g or doc.id.startswith("anime_"):
-                          anime_docs.append((doc, d))
-
-                  for doc, d in anime_docs:
-                      title_name = d.get("title", doc.id)
-                      video_url = str(d.get("videoUrl", "")).strip()
-                      media_type = d.get("type", "series")
-                      seasons_eps = {}
-                      broken_ep_refs = []
-                      all_ep_refs = []
-                      needs_repair = False
-
-                      ep_entries = []
-                      try:
-                          for ep_doc in doc.reference.collection("episodes").stream():
-                              all_ep_refs.append(ep_doc.reference)
-                              ep_data = ep_doc.to_dict() or {}
-                              s_num = int(ep_data.get("seasonNumber", 1) or 1)
-                              e_num = int(ep_data.get("episodeNumber", 1) or 1)
-                              s_url = str(ep_data.get("streamUrl") or ep_data.get("videoUrl") or "").strip()
-                              if "pixeldrain" in s_url.lower() and "/u/" in s_url.lower():
-                                  fixed_pd = normalize_pixeldrain_url(s_url)
-                                  if fixed_pd:
-                                      s_url = fixed_pd
-                                      ep_doc.reference.set({"videoUrl": s_url, "streamUrl": s_url}, merge=True)
-                              ep_entries.append((ep_doc.reference, s_num, e_num, s_url))
-                      except Exception:
-                          pass
-
-                      # Verify liveness of episode URLs in parallel (fast 10-worker check)
-                      if ep_entries:
-                          urls_to_check = list({entry[3] for entry in ep_entries if entry[3]})
-                          with ThreadPoolExecutor(max_workers=10) as pool:
-                              results = list(pool.map(lambda u: (u, is_stream_alive(session, u)), urls_to_check))
-                          liveness_map = dict(results)
-
-                          for ep_ref, s_num, e_num, s_url in ep_entries:
-                              if s_url and liveness_map.get(s_url, False):
-                                  seasons_eps.setdefault(s_num, {})[e_num] = s_url
-                              else:
-                                  broken_ep_refs.append(ep_ref)
-                                  needs_repair = True
-                                  print(f"  [Dead Episode Link Detected] '{title_name}' S{s_num:02d}E{e_num:02d} -> {s_url[:65]}")
-
-                      if media_type == "movie" and not is_stream_alive(session, video_url):
-                          needs_repair = True
-                          print(f"  [Dead Movie Link Detected] '{title_name}' -> {video_url[:65]}")
-
-                      for bref in broken_ep_refs:
+                      t_name = d.get("title", "")
+                      # Auto-delete if user has blocked this title
+                      if is_title_blocked(t_name) or is_title_blocked(doc.id):
+                          log(f"  [Auto-Cleanup] Deleting blocked anime from CineNova: '{t_name}' ({doc.id})")
                           try:
-                              bref.delete()
-                          except Exception:
-                              pass
+                              for ep_doc in titles_ref.document(doc.id).collection("episodes").stream():
+                                  ep_doc.reference.delete()
+                              doc.reference.delete()
+                              log(f"  [Auto-Cleanup] Successfully removed '{t_name}'.")
+                          except Exception as ce:
+                              log(f"  [Warn] Failed deleting blocked document: {ce}")
+                          continue
 
-                      if needs_repair:
-                          repaired_queue_count += 1
+                      g = d.get("genres", [])
+                      if not ("Anime" in g or "Animation" in g or doc.id.startswith("anime_")):
+                          continue
 
                       existing_anime[doc.id] = {
                           "id": doc.id,
-                          "title": title_name,
-                          "type": media_type,
+                          "title": t_name,
                           "seasonCount": int(d.get("seasonCount", 1) or 1),
-                          "videoUrl": video_url if is_stream_alive(session, video_url) else "",
-                          "seasons_eps": seasons_eps,
-                          "all_ep_refs": all_ep_refs,
-                          "needs_repair": needs_repair,
+                          "videoUrl": str(d.get("videoUrl", "")),
                       }
-
-                  print(
-                      f"Loaded {len(existing_anime)} anime titles from Firestore "
-                      f"({repaired_queue_count} queued for dead-link repair)."
-                  )
+                  log(f"Database ready: {len(existing_anime)} anime series found.")
               except Exception as e:
-                  print(f"[Warn] Error inspecting existing anime in Firestore: {e}")
+                  log(f"[Warn] Error checking anime in Firestore: {e}")
 
               return existing_anime
 
-
           def main():
-              print("=" * 75)
-              print("CineNova Automated Anime Scraper & Multi-Option Liveness Verification")
-              print("=" * 75)
+              log("=" * 65)
+              log("CineNova Automated Anime Scraper & Auto-Publisher (HubCloud Batch)")
+              log("=" * 65)
 
               db = init_firestore_db()
               session = create_http_session()
               titles_ref = db.collection("titles")
 
-              existing_anime = load_and_clean_existing_anime(session, titles_ref)
-              target_urls, seen_urls = collect_target_anime_urls(session, DEFAULT_SITE_URL, existing_anime)
+              existing_anime = load_fast_existing_anime(titles_ref)
+              target_urls, seen_urls = collect_target_anime_urls(session, DEFAULT_SITE_URL)
+              log(f"Target anime series to process: {len(target_urls)}")
 
-              searched_series_titles = set()
               published_count = 0
+              searched_series_titles = set()
               idx = 0
 
               while idx < len(target_urls):
                   post_url = target_urls[idx]
                   idx += 1
-                  print(f"\n[{idx}/{len(target_urls)}] Checking: {post_url}")
+                  if is_title_blocked(post_url):
+                      log(f"\n[{idx}/{len(target_urls)}] [Blocked URL] Skipping {post_url}")
+                      continue
 
+                  log(f"\n[{idx}/{len(target_urls)}] Processing: {post_url}")
                   details = fetch_anime_post_details(session, post_url)
                   if not details or not details["raw_title"]:
                       continue
 
                   clean_title, season_number, language, year = sanitize_anime_title(details["raw_title"])
+                  if is_title_blocked(clean_title) or is_title_blocked(details["raw_title"]):
+                      log(f"  [Filter Blocked] Skipping '{clean_title}' (User filter: Tom & Jerry / Dragon Ball)")
+                      continue
                   slug = re.sub(r"[^a-z0-9]+", "_", clean_title.lower()).strip("_")
                   doc_id = f"anime_{slug}"[:60]
 
-                  raw_ep_map, raw_ep_titles = extract_raw_episode_map(details["html"])
+                  # Parse HubCloud episode buttons from post HTML in memory (0 network calls)
+                  raw_ep_map, raw_ep_titles = extract_raw_hubcloud_episode_map(details["html"])
                   if not raw_ep_map:
-                      print(f"  [Skip] No HubCloud/WatchMultQuality/DLBeta links available on page for '{clean_title}'.")
+                      log(f"  [Skip] No HubCloud links available on page for '{clean_title}'.")
                       continue
 
-                  is_movie = is_anime_movie_post(details["raw_title"], details["html"], post_url, raw_ep_map)
-
-                  # Discover all seasons for multi-season anime series (scans direct companion links in HTML + search pages)
-                  if not is_movie and clean_title.lower() not in searched_series_titles:
+                  # Discover all companion seasons (e.g. Naruto Shippuden Seasons 1 to 17)
+                  if clean_title.lower() not in searched_series_titles:
                       searched_series_titles.add(clean_title.lower())
                       related_urls = discover_all_seasons_for_series(session, DEFAULT_SITE_URL, clean_title, details["html"], seen_urls)
                       if related_urls:
-                          print(f"  [Multi-Season Discovery] Found {len(related_urls)} additional season/related posts for '{clean_title}'!")
+                          log(f"  [Multi-Season Discovery] Found {len(related_urls)} companion season posts for '{clean_title}'!")
                           target_urls.extend(related_urls)
 
-                  if is_movie:
-                      existing_info = existing_anime.get(doc_id, {})
-                      if (
-                          existing_info.get("type") == "movie"
-                          and existing_info.get("videoUrl")
-                          and not existing_info.get("needs_repair")
-                          and not existing_info.get("seasons_eps")
-                      ):
-                          print(f"  [Already Added & Verified] Anime Movie '{clean_title}' has a live stream. Skipping!")
-                          continue
+                  # Fetch existing episodes for this specific season only (fast single query)
+                  existing_season_eps = {}
+                  try:
+                      for ep_doc in titles_ref.document(doc_id).collection("episodes").where("seasonNumber", "==", season_number).stream():
+                          ep_d = ep_doc.to_dict() or {}
+                          e_num = int(ep_d.get("episodeNumber", 1) or 1)
+                          s_url = str(ep_d.get("streamUrl") or ep_d.get("videoUrl") or "").strip()
+                          if s_url:
+                              existing_season_eps[e_num] = s_url
+                  except Exception:
+                      pass
 
-                      episodes_map = resolve_anime_episodes(session, raw_ep_map, {}, post_url)
-                      if not episodes_map:
-                          print(f"  [Skip] Could not resolve a live stream for Anime Movie '{clean_title}'.")
-                          continue
-
-                      first_stream = episodes_map[sorted(episodes_map.keys())[0]]
-                      poster = details["poster"] or "drawable://img_hero_nebula"
-                      genres = ["Anime", "Animation", "Action", "Fantasy", "Adventure"]
-
-                      titles_ref.document(doc_id).set(
-                          {
-                              "authorId": "github_automation",
-                              "type": "movie",
-                              "title": clean_title[:200],
-                              "description": (
-                                  details["synopsis"]
-                                  or f"Watch and download {clean_title} ({year}) full anime movie in {language} with offline support."
-                              )[:2000],
-                              "poster": poster[:500],
-                              "backdrop": poster[:500],
-                              "genres": genres,
-                              "cast": ["Original Japanese & Hindi Voice Cast"],
-                              "director": "Anime Theatrical Release",
-                              "language": language[:50],
-                              "year": year,
-                              "rating": 8.9,
-                              "ageRating": "U/A 13+",
-                              "duration": "1h 55m",
-                              "trailerUrl": first_stream[:500],
-                              "videoUrl": first_stream[:500],
-                              "subtitles": ["English", "Hindi"],
-                              "audioTracks": ["Hindi", "Japanese"],
-                              "isFeatured": (published_count < 4),
-                              "isTrending": (published_count < 12),
-                              "isNewRelease": True,
-                              "isUpcoming": False,
-                              "isPublished": True,
-                              "viewsCount": 0,
-                              "seasonCount": 1,
-                              "createdAt": firestore.SERVER_TIMESTAMP,
-                              "updatedAt": firestore.SERVER_TIMESTAMP,
-                          },
-                          merge=True,
-                      )
-
-                      for ep_doc in titles_ref.document(doc_id).collection("episodes").stream():
-                          try:
-                              ep_doc.reference.delete()
-                          except Exception:
-                              pass
-
-                      published_count += 1
-                      existing_anime[doc_id] = {
-                          "id": doc_id,
-                          "title": clean_title,
-                          "type": "movie",
-                          "seasonCount": 1,
-                          "videoUrl": first_stream,
-                          "seasons_eps": {},
-                          "needs_repair": False,
-                      }
-                      print(f"  => SUCCESS: Published Anime Movie '{clean_title}' (type='movie') -> {first_stream}")
-                      continue
-
-                  # Multi-episode Anime Series handling
-                  existing_season_eps = (
-                      existing_anime.get(doc_id, {}).get("seasons_eps", {}).get(season_number, {})
-                  )
-
-                  # SMART SKIP: Only skip if EVERY episode on the page for this season is ALREADY in Firestore AND verified live!
+                  # Skip only if all episodes already present in Firestore
                   if existing_season_eps and all(ep in existing_season_eps for ep in raw_ep_map.keys()):
-                      print(
-                          f"  [Already Added & Verified] Anime Series '{clean_title}' Season {season_number} has all {len(raw_ep_map)} live episodes in CineNova. Skipping!"
+                      log(
+                          f"  [Already Added] Anime '{clean_title}' Season {season_number} has all {len(raw_ep_map)} episodes in CineNova. Skipping!"
                       )
                       continue
 
@@ -1133,19 +596,13 @@ jobs:
                   )
 
                   if not episodes_map:
-                      print(f"  [Skip] Could not resolve any working episodes for '{clean_title}' Season {season_number}.")
+                      log(f"  [Skip] Could not resolve any HubCloud episodes for '{clean_title}'.")
                       continue
 
                   poster = details["poster"] or "drawable://img_hero_nebula"
                   sorted_eps = sorted(episodes_map.keys())
                   first_stream = episodes_map[sorted_eps[0]]
-
-                  existing_seasons_dict = existing_anime.get(doc_id, {}).get("seasons_eps", {})
-                  all_known_seasons = set(existing_seasons_dict.keys()) | {season_number}
-                  max_season_num = max(
-                      existing_anime.get(doc_id, {}).get("seasonCount", 1),
-                      max(all_known_seasons),
-                  )
+                  current_seasons = existing_anime.get(doc_id, {}).get("seasonCount", 1)
 
                   genres = ["Anime", "Animation", "Action", "Fantasy", "Adventure"]
                   titles_ref.document(doc_id).set(
@@ -1155,7 +612,7 @@ jobs:
                           "title": clean_title[:200],
                           "description": (
                               details["synopsis"]
-                              or f"Watch and download {clean_title} in {language} with all seasons and episodes available offline."
+                              or f"Watch and download {clean_title} Season {season_number} in {language} with full offline support."
                           )[:2000],
                           "poster": poster[:500],
                           "backdrop": poster[:500],
@@ -1166,7 +623,7 @@ jobs:
                           "year": year,
                           "rating": 8.8,
                           "ageRating": "U/A 13+",
-                          "duration": f"{len(all_known_seasons)} Seasons" if len(all_known_seasons) > 1 else f"Season {season_number}",
+                          "duration": f"Season {season_number}",
                           "trailerUrl": first_stream[:500],
                           "videoUrl": first_stream[:500],
                           "subtitles": ["English", "Hindi"],
@@ -1177,7 +634,7 @@ jobs:
                           "isUpcoming": False,
                           "isPublished": True,
                           "viewsCount": 0,
-                          "seasonCount": max_season_num,
+                          "seasonCount": max(current_seasons, season_number),
                           "createdAt": firestore.SERVER_TIMESTAMP,
                           "updatedAt": firestore.SERVER_TIMESTAMP,
                       },
@@ -1215,24 +672,18 @@ jobs:
                       {
                           "id": doc_id,
                           "title": clean_title,
-                          "type": "series",
-                          "seasonCount": max_season_num,
+                          "seasonCount": max(current_seasons, season_number),
                           "videoUrl": first_stream,
-                          "seasons_eps": {},
-                          "needs_repair": False,
                       },
-                  )["seasons_eps"][season_number] = dict(episodes_map)
-                  existing_anime[doc_id]["seasonCount"] = max_season_num
-                  existing_anime[doc_id]["needs_repair"] = False
-
-                  print(
-                      f"  => SUCCESS: Published/Repaired '{clean_title}' Season {season_number} with {len(valid_ep_ids)} live episodes!"
                   )
 
-              print("\n" + "=" * 75)
-              print(f"Anime Automation Finished! Total Anime Series/Movies Published/Repaired: {published_count}")
-              print("=" * 75)
+                  log(
+                      f"  => SUCCESS: Published '{clean_title}' Season {season_number} with {len(valid_ep_ids)} real HubCloud episodes!"
+                  )
 
+              log("\n" + "=" * 65)
+              log(f"Anime Automation Finished! Total Series Published/Updated: {published_count}")
+              log("=" * 65)
 
           if __name__ == "__main__":
               main()
