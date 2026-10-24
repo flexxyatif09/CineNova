@@ -12,9 +12,9 @@ on:
         required: false
         default: 'https://www.rareanimes.mov'
       max_items:
-        description: 'Kitne anime posts scrape karne hain (Default: 45)'
+        description: 'Kitne anime posts scrape karne hain (Default: 120)'
         required: false
-        default: '45'
+        default: '120'
 
 jobs:
   sync-anime-to-firestore:
@@ -40,7 +40,8 @@ jobs:
           FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
           FIREBASE_DATABASE_ID: "ai-studio-android-devbuild-a9589065-5570-4074-a613-1c0430bf6841"
           ANIME_SITE_URL: ${{ github.event.inputs.site_url || 'https://www.rareanimes.mov' }}
-          MAX_ANIME_PER_RUN: ${{ github.event.inputs.max_items || '45' }}
+          MAX_ANIME_PER_RUN: ${{ github.event.inputs.max_items || '120' }}
+          FALLBACK_SITE_URL: "https://animedubhindi.link"
           PYTHONUNBUFFERED: "1"
         run: |
           python3 -u - << 'EOF'
@@ -71,7 +72,7 @@ jobs:
               "FIREBASE_DATABASE_ID",
               "ai-studio-android-devbuild-a9589065-5570-4074-a613-1c0430bf6841",
           )
-          MAX_ANIME_PER_RUN = int(os.environ.get("MAX_ANIME_PER_RUN", 45))
+          MAX_ANIME_PER_RUN = int(os.environ.get("MAX_ANIME_PER_RUN", 120))
 
           USER_AGENT = (
               "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) "
@@ -105,7 +106,7 @@ jobs:
               norm = re.sub(r"\s+", " ", norm).strip()
               for kw in BLOCKED_KEYWORDS:
                   kw_norm = re.sub(r"[-_&.+:]+", " ", kw.lower()).strip()
-                  if kw_norm and kw_norm in norm:
+                  if kw_norm and re.search(r"(?<![a-z0-9])" + re.escape(kw_norm) + r"(?![a-z0-9])", norm):
                       return True
               return False
 
@@ -431,7 +432,7 @@ jobs:
               seen = set()
               collected = []
 
-              pages_to_check = [f"{anime_cat_url}/"] + [f"{anime_cat_url}/page/{i}/" for i in range(2, 12)]
+              pages_to_check = [f"{anime_cat_url}/"] + [f"{anime_cat_url}/page/{i}/" for i in range(2, 31)]
               for page_url in pages_to_check:
                   if len(collected) >= MAX_ANIME_PER_RUN:
                       break
@@ -562,6 +563,174 @@ jobs:
 
               return existing_anime
 
+          from bs4 import NavigableString
+
+          FALLBACK_SITE_URL = os.environ.get("FALLBACK_SITE_URL", "https://animedubhindi.link").rstrip("/")
+          FB_HUB_KEYS = ("hubcloud", "razorshell", "pixeldrain", "gamerxyt")
+          FB_DEAD_MARKERS = (
+              "file not found", "file has been removed", "file removed", "has been deleted",
+              "link expired", "invalid link", "no longer available", "file does not exist",
+          )
+
+          def is_link_alive(session, url: str, referer: str = ""):
+              # Sirf pakka dead (404/410 ya "file deleted" page) hone par False; shaque me True.
+              try:
+                  r = session.get(url, timeout=12, stream=True, allow_redirects=True,
+                                  headers={"Referer": referer or f"{DEFAULT_SITE_URL}/"})
+              except Exception:
+                  return False
+              try:
+                  if r.status_code in (404, 410):
+                      return False
+                  if "text/html" in r.headers.get("Content-Type", "").lower():
+                      body = next(r.iter_content(60000), b"").decode("utf-8", "ignore").lower()
+                      if any(m in body for m in FB_DEAD_MARKERS):
+                          return False
+                  return True
+              finally:
+                  r.close()
+
+          def _norm_title(t: str) -> str:
+              return re.sub(r"[^a-z0-9]+", " ", (t or "").lower()).strip()
+
+          def fallback_find_post(session, clean_title: str, season_number: int):
+              want = _norm_title(clean_title)
+              try:
+                  r = session.get(
+                      f"{FALLBACK_SITE_URL}/?s={quote_plus(clean_title)}",
+                      timeout=12, headers={"Referer": FALLBACK_SITE_URL + "/"},
+                  )
+                  if not r.ok:
+                      return None
+                  soup = BeautifulSoup(r.text, "lxml")
+                  partial = None
+                  for a in soup.select("article .entry-title a, article h2 a, article h3 a"):
+                      href = (a.get("href") or "").strip()
+                      title = a.get_text(" ", strip=True)
+                      if not href or is_title_blocked(title):
+                          continue
+                      c_title, c_season, _, _ = sanitize_anime_title(title)
+                      if c_season != season_number:
+                          continue
+                      n = _norm_title(c_title)
+                      if n == want:
+                          return href
+                      if partial is None and len(n) >= 4 and (want in n or n in want):
+                          partial = href
+                  return partial
+              except Exception as e:
+                  log(f"  [Fallback][Warn] Search failed: {e}")
+                  return None
+
+          def fallback_find_episode_page(post_html: str):
+              soup = BeautifulSoup(post_html, "lxml")
+              anchors = soup.find_all("a", href=True)
+              for a in anchors:
+                  if "adhlinks" in a["href"].lower():
+                      return a["href"].strip()
+              for a in anchors:
+                  label = a.get_text(" ", strip=True).lower()
+                  if "download" in label and "watch" in label:
+                      return a["href"].strip()
+              return None
+
+          def _fb_quality_rank(label: str) -> int:
+              l = label.lower()
+              base = 0 if "720" in l else 1 if "480" in l else 2 if "1080" in l else 3
+              return base + (10 if ("x265" in l or "hevc" in l or "10bit" in l) else 0)
+
+          def parse_adhlinks_episodes(page_html: str):
+              # return: {ep_number: [(rank, kind_priority, href), ...]}
+              soup = BeautifulSoup(page_html, "lxml")
+              root = soup.body or soup
+              ep_re = re.compile(r"Episode\s*:?\s*0*(\d{1,4})", re.I)
+              q_re = re.compile(r"\b(?:480|720|1080|2160)\s*p\b", re.I)
+              eps = {}
+              cur_ep, cur_label = None, ""
+              for node in root.descendants:
+                  if isinstance(node, NavigableString):
+                      if node.find_parent("a"):
+                          continue
+                      t = str(node).strip()
+                      if not t:
+                          continue
+                      m = ep_re.search(t)
+                      if m and len(t) < 40:
+                          cur_ep, cur_label = int(m.group(1)), ""
+                      elif q_re.search(t):
+                          cur_label = t
+                      elif "watch online" in t.lower():
+                          cur_label = "watch"
+                  elif getattr(node, "name", None) == "a" and node.get("href") and cur_ep is not None:
+                      label = node.get_text(" ", strip=True).lower()
+                      href = node["href"].strip()
+                      if cur_label == "watch":
+                          continue  # "Click Here" streaming page abhi skip
+                      if "hcloud" in label or "hubcloud" in label:
+                          kind = 0
+                      elif "multi" in label:
+                          kind = 1
+                      else:
+                          continue  # GDF / MEGA / Fprs skip
+                      eps.setdefault(cur_ep, []).append((_fb_quality_rank(cur_label), kind, href))
+              return eps
+
+          def resolve_fallback_link(session, href: str, referer: str):
+              low = href.lower()
+              if any(k in low for k in FB_HUB_KEYS):
+                  return href
+              got = resolve_codedew_to_hubcloud(session, href, referer)
+              if got and "codedew.com" not in got.lower():
+                  return got
+              try:
+                  r = session.get(href, timeout=12, allow_redirects=True, headers={"Referer": referer})
+                  if any(k in r.url.lower() for k in FB_HUB_KEYS):
+                      return r.url
+                  m = re.search(r"https?://[^\s\"'<>]*hubcloud[^\s\"'<>]*", r.text, re.I)
+                  if m:
+                      return html.unescape(m.group(0))
+              except Exception:
+                  pass
+              return None
+
+          def fetch_from_animedubhindi(session, clean_title: str, season_number: int, wanted=None, skip=None):
+              skip = skip or set()
+              result = {}
+              post_url = fallback_find_post(session, clean_title, season_number)
+              if not post_url:
+                  log(f"  [Fallback] '{clean_title}' S{season_number} not found on {FALLBACK_SITE_URL}")
+                  return result
+              log(f"  [Fallback] Matched post: {post_url}")
+              try:
+                  r1 = session.get(post_url, timeout=12, headers={"Referer": FALLBACK_SITE_URL + "/"})
+                  hub_url = fallback_find_episode_page(r1.text) if r1.ok else None
+                  if not hub_url:
+                      log("  [Fallback] Download/Watch button link not found on post.")
+                      return result
+                  r2 = session.get(urljoin(post_url, hub_url), timeout=15, headers={"Referer": post_url})
+                  if not r2.ok:
+                      log(f"  [Fallback] Episode page HTTP {r2.status_code}")
+                      return result
+                  eps = parse_adhlinks_episodes(r2.text)
+                  log(f"  [Fallback] Episode page parsed: {len(eps)} episodes (html {len(r2.text)} bytes)")
+              except Exception as e:
+                  log(f"  [Fallback][Warn] {e}")
+                  return result
+
+              for ep in sorted(eps):
+                  if ep in skip or (wanted is not None and ep not in wanted):
+                      continue
+                  cands = [h for _, _, h in sorted(eps[ep], key=lambda x: (x[0], x[1]))][:6]
+                  for href in cands:
+                      url = resolve_fallback_link(session, urljoin(r2.url, href), r2.url)
+                      if url and is_link_alive(session, url, r2.url):
+                          result[ep] = url
+                          log(f"    [Ep {ep:02d}] Fallback stream -> {url[:60]}...")
+                          break
+                  else:
+                      log(f"    [Ep {ep:02d}] Fallback: no working link.")
+              return result
+
           def main():
               log("=" * 65)
               log("CineNova Automated Anime Scraper & Auto-Publisher")
@@ -600,8 +769,7 @@ jobs:
 
                   raw_ep_map, raw_ep_titles = extract_raw_hubcloud_episode_map(details["html"])
                   if not raw_ep_map:
-                      log(f"  [Skip] No stream links available on page for '{clean_title}'.")
-                      continue
+                      log(f"  [Info] No stream links on primary page for '{clean_title}' - trying fallback site.")
 
                   if clean_title.lower() not in searched_series_titles:
                       searched_series_titles.add(clean_title.lower())
@@ -621,15 +789,42 @@ jobs:
                   except Exception:
                       pass
 
-                  if existing_season_eps and all(ep in existing_season_eps for ep in raw_ep_map.keys()):
+                  known_eps = set(existing_season_eps.keys())
+                  gap_eps = (set(range(1, max(known_eps) + 1)) - known_eps) if known_eps else set()
+                  if gap_eps:
+                      log(f"  [Gap] '{clean_title}' S{season_number} missing episodes in DB: {sorted(gap_eps)}")
+                  if raw_ep_map and existing_season_eps and not gap_eps and all(ep in existing_season_eps for ep in raw_ep_map.keys()):
                       log(
                           f"  [Already Added] Anime '{clean_title}' Season {season_number} has all {len(raw_ep_map)} episodes in CineNova. Skipping!"
                       )
                       continue
 
-                  episodes_map = resolve_anime_episodes(
-                      session, raw_ep_map, existing_season_eps, post_url
+                  episodes_map = (
+                      resolve_anime_episodes(session, raw_ep_map, existing_season_eps, post_url)
+                      if raw_ep_map else {}
                   )
+
+                  # Primary site ke naye resolve hue links verify karo
+                  for _ep in list(episodes_map.keys()):
+                      if _ep not in existing_season_eps and not is_link_alive(session, episodes_map[_ep], post_url):
+                          log(f"    [Ep {_ep:02d}] Primary link dead -> fallback try hoga.")
+                          episodes_map.pop(_ep)
+
+                  expected_eps = set(raw_ep_map.keys())
+                  missing_eps = (expected_eps - set(episodes_map.keys())) if expected_eps else None
+                  if missing_eps is not None:
+                      missing_eps |= (gap_eps - set(episodes_map.keys()))
+
+                  if missing_eps is None or missing_eps:
+                      fb_eps = fetch_from_animedubhindi(
+                          session, clean_title, season_number,
+                          wanted=missing_eps,
+                          skip=set(existing_season_eps.keys()) | set(episodes_map.keys()),
+                      )
+                      for _ep, _url in fb_eps.items():
+                          episodes_map[_ep] = _url
+                      if fb_eps:
+                          log(f"  [Fallback] Added {len(fb_eps)} episodes from AnimeDubHindi.")
 
                   if not episodes_map:
                       log(f"  [Skip] Could not resolve any episodes for '{clean_title}'.")
@@ -723,4 +918,4 @@ jobs:
 
           if __name__ == "__main__":
               main()
-          EOF
+          EOF````
