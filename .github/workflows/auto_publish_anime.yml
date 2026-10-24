@@ -524,19 +524,29 @@ jobs:
 
           def extract_raw_episode_map(post_html: str):
               """
-              Pure in-memory regex parser: extracts {episode_number: [codedew_urls]}
-              Includes all 3 server options on the site ([HubCloud], [WatchMultQuality], [DLBeta] / [PixelDrain])
-              while strictly selecting ONLY Hindi Dubbed links whenever Hindi is present (never falling back to Tamil/Telugu).
+              Pure in-memory regex parser: extracts ({episode_number: [codedew_urls]}, {episode_number: episode_title})
+              Includes all 3 server options on the site ([HubCloud], [WatchMultQuality], [DLBeta] / [PixelDrain]).
+              - STRICTLY EXCLUDES 'Untouched CR' / 'Untouched' 1GB+ files.
+              - Extracts real episode name from post text (e.g. 'Episode 01 – The Future Is in Our Hands').
+              - Strictly selects ONLY Hindi Dubbed links whenever Hindi is present (never falling back to Tamil/Telugu).
               """
               episodes_raw = {}
+              episodes_titles = {}
               blocks = re.split(r"(Episode\s*0*\d+[^<\n]*)", post_html, flags=re.I)
               current_ep = 1
               found_any_ep_heading = False
 
               for block in blocks:
-                  ep_m = re.match(r"Episode\s*0*(\d+)", block.strip(), re.I)
+                  ep_m = re.match(r"^Episode\s*0*(\d+)(?:\s*[-–—:]\s*(.+))?", block.strip(), re.I)
                   if ep_m:
                       current_ep = int(ep_m.group(1))
+                      raw_title = (ep_m.group(2) or "").strip()
+                      clean_name = re.sub(r"<[^>]+>", "", raw_title).strip()
+                      clean_name = re.sub(r"[\-–—\s]+$", "", clean_name).strip()
+                      clean_name = re.sub(r"\b(?:new!?|hd)\b", "", clean_name, flags=re.I).strip()
+                      clean_name = re.sub(r"[\-–—\s]+$", "", clean_name).strip()
+                      if clean_name and "untouched" not in clean_name.lower():
+                          episodes_titles[current_ep] = clean_name
                       found_any_ep_heading = True
                   else:
                       if not found_any_ep_heading and len(blocks) > 1:
@@ -562,6 +572,11 @@ jobs:
 
                       for unit in sub_units:
                           unit_text = re.sub(r"<[^>]+>", " ", unit).lower()
+
+                          # CRITICAL: STRICTLY SKIP ANY UNTOUCHED CR UNITS (1GB+ UNCOMPRESSED CR FILES)
+                          if "untouched" in unit_text:
+                              continue
+
                           unit_a_tags = re.findall(
                               r"<a\s+[^>]*href=[\x27\"](https?://(?:codedew\.com|[^/]*hubcloud|[^/]*pixeldrain|[^/]*razorshell)[^\x27\"]+)[\x27\"][^>]*>((?:(?!</a>)[\s\S])*)</a>",
                               unit,
@@ -578,6 +593,11 @@ jobs:
 
                           for href, inner in unit_a_tags:
                               label = re.sub(r"<[^>]+>", "", inner).strip().lower()
+
+                              # Do not take any untouched link if labeled in href/anchor
+                              if "untouched" in label or "untouched" in href.lower():
+                                  continue
+
                               is_hub = "hubcloud" in label or "hubcloud" in href.lower()
                               is_multiquality = (
                                   "multquality" in label
@@ -646,6 +666,8 @@ jobs:
                   dlbeta_links = []
                   for href, inner in a_tags:
                       label = re.sub(r"<[^>]+>", "", inner).strip().lower()
+                      if "untouched" in label or "untouched" in href.lower():
+                          continue
                       if "hubcloud" in label or "hubcloud" in href.lower():
                           hub_links.append(href)
                       elif "multquality" in label or "multiquality" in label or "multiquality" in href.lower():
@@ -656,7 +678,7 @@ jobs:
                   if combined:
                       episodes_raw[1] = combined
 
-              return episodes_raw
+              return episodes_raw, episodes_titles
 
 
           def resolve_anime_episodes(session, raw_ep_map: dict, existing_season_eps: dict, post_url: str):
@@ -784,24 +806,45 @@ jobs:
               return urls
 
 
-          def discover_all_seasons_for_series(session, base_url: str, clean_title: str, seen_urls: set):
+          def discover_all_seasons_for_series(session, base_url: str, clean_title: str, post_html: str, seen_urls: set):
               """
-              Searches `rareanimes.mov/?s=<clean_title>` to find ALL seasons (Season 1, 2, 3, 4...)
-              of an anime series so older seasons or anime needing link repair are automatically discovered!
+              Discovers ALL seasons of a series:
+              1. Scans post_html directly for companion season URLs (e.g. naruto-shippuden-season-01..17).
+              2. Queries WordPress search `rareanimes.mov/?s=<clean_title>` with pagination across pages 1..3.
               """
               discovered = []
+              clean_slug = re.sub(r"[^a-z0-9]+", "-", clean_title.lower()).strip("-")
+
+              # Step 1: Scan direct links from the post HTML itself
+              if post_html:
+                  direct_links = re.findall(
+                      r"href=[\x27\"](https?://(?:www\.)?rareanimes\.mov/[^\x27\"#?]+)[\x27\"]",
+                      post_html,
+                      re.I,
+                  )
+                  for dl in direct_links:
+                      clean_u = dl.split("?")[0].rstrip("/") + "/"
+                      if clean_u in seen_urls or is_blocked_url(clean_u):
+                          continue
+                      if (clean_slug in clean_u.lower() or "season" in clean_u.lower()) and re.search(r"season[-_]?0*\d+", clean_u, re.I):
+                          seen_urls.add(clean_u)
+                          discovered.append(clean_u)
+
+              # Step 2: Query WordPress search with pagination
               query = quote_plus(clean_title)
-              search_url = f"{base_url}/?s={query}"
-              try:
-                  r = session.get(search_url, timeout=15)
-                  if not r.ok:
-                      return discovered
-                  for u in extract_article_urls_from_html(r.text):
-                      if u not in seen_urls:
-                          seen_urls.add(u)
-                          discovered.append(u)
-              except Exception as e:
-                  print(f"  [Warn] Season search failed for '{clean_title}': {e}")
+              for p in range(1, 4):
+                  search_url = f"{base_url}/?s={query}" if p == 1 else f"{base_url}/page/{p}/?s={query}"
+                  try:
+                      r = session.get(search_url, timeout=12)
+                      if not r.ok:
+                          continue
+                      for u in extract_article_urls_from_html(r.text):
+                          if u not in seen_urls:
+                              seen_urls.add(u)
+                              discovered.append(u)
+                  except Exception:
+                      break
+
               return discovered
 
 
@@ -853,7 +896,7 @@ jobs:
                   if needs_repair or has_missing_season or has_partial_s1:
                       reason = "Dead Link Repair" if needs_repair else "Season Discovery"
                       print(f"  [{reason}] Searching posts on site for existing anime: '{title_str}'...")
-                      extra_urls = discover_all_seasons_for_series(session, base_url, title_str, seen)
+                      extra_urls = discover_all_seasons_for_series(session, base_url, title_str, "", seen)
                       for eu in reversed(extra_urls):
                           collected.insert(0, eu)
 
@@ -983,17 +1026,17 @@ jobs:
                   slug = re.sub(r"[^a-z0-9]+", "_", clean_title.lower()).strip("_")
                   doc_id = f"anime_{slug}"[:60]
 
-                  raw_ep_map = extract_raw_episode_map(details["html"])
+                  raw_ep_map, raw_ep_titles = extract_raw_episode_map(details["html"])
                   if not raw_ep_map:
                       print(f"  [Skip] No HubCloud/WatchMultQuality/DLBeta links available on page for '{clean_title}'.")
                       continue
 
                   is_movie = is_anime_movie_post(details["raw_title"], details["html"], post_url, raw_ep_map)
 
-                  # Discover all seasons for multi-season anime series
+                  # Discover all seasons for multi-season anime series (scans direct companion links in HTML + search pages)
                   if not is_movie and clean_title.lower() not in searched_series_titles:
                       searched_series_titles.add(clean_title.lower())
-                      related_urls = discover_all_seasons_for_series(session, DEFAULT_SITE_URL, clean_title, seen_urls)
+                      related_urls = discover_all_seasons_for_series(session, DEFAULT_SITE_URL, clean_title, details["html"], seen_urls)
                       if related_urls:
                           print(f"  [Multi-Season Discovery] Found {len(related_urls)} additional season/related posts for '{clean_title}'!")
                           target_urls.extend(related_urls)
@@ -1147,13 +1190,14 @@ jobs:
                   for ep_num, stream_url in episodes_map.items():
                       ep_doc_id = f"s{season_number}_ep{ep_num}"
                       valid_ep_ids.add(ep_doc_id)
+                      ep_title = raw_ep_titles.get(ep_num) or f"Episode {ep_num}"
                       episodes_col.document(ep_doc_id).set(
                           {
                               "titleId": doc_id,
                               "seasonNumber": season_number,
                               "episodeNumber": ep_num,
-                              "title": f"Episode {ep_num}",
-                              "description": f"{clean_title} - Season {season_number}, Episode {ep_num}",
+                              "title": ep_title[:200],
+                              "description": f"{clean_title} - Season {season_number}, Episode {ep_num}: {ep_title}"[:500],
                               "thumbnail": poster[:500],
                               "duration": "24m",
                               "videoUrl": stream_url[:500],
