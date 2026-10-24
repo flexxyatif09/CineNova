@@ -54,10 +54,8 @@ jobs:
           import warnings
           from urllib.parse import quote_plus, urljoin
 
-          # Suppress library warnings
           warnings.filterwarnings("ignore")
 
-          # Force instant unbuffered live output in GitHub Actions
           if hasattr(sys.stdout, "reconfigure"):
               sys.stdout.reconfigure(line_buffering=True)
           if hasattr(sys.stderr, "reconfigure"):
@@ -81,51 +79,23 @@ jobs:
               "Chrome/126.0.0.0 Mobile Safari/537.36"
           )
 
-          # Blocklist: Tokusatsu / Power Rangers / Cartoons to strictly EXCLUDE (Only pure Anime allowed)
           BLOCKED_KEYWORDS = [
-              # Power Rangers / Tokusatsu / Live Action
-              "power ranger",
-              "power rangers",
-              "dino fury",
-              "cosmic fury",
-              "beast morphers",
-              "ninja steel",
-              "dino charge",
-              "megaforce",
-              "super megaforce",
-              "kamen rider",
-              "ryukendo",
-              "ultraman",
-              # Dragon Ball & Western Cartoons
-              "dragon ball",
-              "dragonball",
-              "dragon ball z",
-              "dragon ball super",
-              "dragon ball gt",
-              "dragon ball daima",
-              "tom and jerry",
-              "tom & jerry",
-              "tom jerry",
-              "ben 10",
-              "ben10",
-              "oggy",
-              "courage the cowardly dog",
-              "dexter's laboratory",
-              "dexters laboratory",
-              "adventure time",
-              "johnny test",
-              "horrid henry",
-              "supa strikas",
-              "teen titans",
-              "powerpuff",
-              "generator rex",
-              "jackie chan adventures",
-              "winx club",
-              "dc super hero",
-              "chhota bheem",
-              "motu patlu",
-              "bandbudh aur budbak",
-              "roll no 21",
+              "power ranger", "power rangers", "dino fury", "cosmic fury", "beast morphers",
+              "ninja steel", "dino charge", "megaforce", "super megaforce", "samurai ranger",
+              "jungle fury", "mystic force", "s.p.d", "spd", "dino thunder", "ninja storm",
+              "wild force", "time force", "lightspeed rescue", "lost galaxy", "in space",
+              "turbo", "zeo", "mighty morphin", "kamen rider", "ryukendo", "ultraman", "super sentai",
+              "dragon ball", "dragonball", "dragon ball z", "dragon ball super", "dragon ball gt",
+              "dragon ball daima", "dragon ball kai", "dbz",
+              "tom and jerry", "tom & jerry", "tom jerry", "ben 10", "ben10", "oggy",
+              "courage the cowardly dog", "dexter's laboratory", "dexters laboratory",
+              "adventure time", "johnny test", "horrid henry", "supa strikas", "teen titans",
+              "powerpuff", "generator rex", "jackie chan adventures", "winx club", "dc super hero",
+              "chhota bheem", "motu patlu", "bandbudh aur budbak", "roll no 21", "kid cosmic",
+              "boonie bears", "dorothy and the wizard of oz", "looney tunes", "bugs bunny",
+              "scooby doo", "scooby-doo", "spongebob", "sponge bob", "spider-man", "spiderman",
+              "batman", "avengers", "iron man", "x-men", "transformers", "barbie",
+              "teenage mutant ninja turtles", "tmnt", "miraculous ladybug", "slugterra"
           ]
 
           def is_title_blocked(text_or_url: str) -> bool:
@@ -211,6 +181,8 @@ jobs:
               clean = re.sub(r"[\(\[]\s*(?:19|20)\d{2}\s*[\)\]]", "", text, flags=re.I)
               clean = re.sub(r"[\(\[]\s*(?:Season|S)\s*\d+.*", "", clean, flags=re.I)
               clean = re.sub(r"\b(?:Season|S)\s*\d+.*", "", clean, flags=re.I)
+              clean = re.sub(r"[\(\[]\s*Part\s*\d+.*", "", clean, flags=re.I)
+              clean = re.sub(r"\bPart\s*\d+.*", "", clean, flags=re.I)
               clean = re.sub(
                   r"\b(?:Hindi\s*Dubbed|Hindi\s*Subbed|Hindi|Tamil|Telugu|Dual\s*Audio|Multi\s*Audio|Episodes?\s*Download|Download\s*HD|All\s*Episodes|Watch\s*Download|Download\s*480p.*)\b.*",
                   "",
@@ -229,73 +201,84 @@ jobs:
               display_title = clean or text[:60].strip()
               return display_title, season_number, language, year
 
-          def is_anime_movie_post(raw_title: str, post_html: str, post_url: str, raw_ep_map: dict) -> bool:
-              if len(raw_ep_map) > 1:
-                  return False
-              text = html.unescape(raw_title or "")
-              url_lower = (post_url or "").lower()
-              has_season_tag = bool(re.search(r"\b(?:Season|S)\s*0*\d+\b", text, re.I)) or bool(
-                  re.search(r"season-\d+", url_lower)
-              )
-              has_episodes_word = bool(re.search(r"\bEpisodes?\b", text, re.I)) or "episodes" in url_lower
-              has_ep_headings = len(re.findall(r"Episode\s*0*\d+", post_html, flags=re.I)) >= 2
-              if has_season_tag or has_episodes_word or has_ep_headings:
-                  return False
-              if re.search(r"\b(?:Movie|Film)\b", text, re.I) or "/movies/" in url_lower or "-movie-" in url_lower:
-                  return True
-              if not re.search(r"Episode\s*0*1\b", post_html, flags=re.I) and len(raw_ep_map) == 1:
-                  return True
-              return False
-
           def resolve_codedew_to_hubcloud(session, codedew_url: str, post_url: str = ""):
+              if not codedew_url:
+                  return None
+
+              lower_url = codedew_url.lower()
+              if any(k in lower_url for k in ["hubcloud", "razorshell.space", "pixeldrain.net", "gamerxyt"]):
+                  return codedew_url
+
               try:
                   req_headers = {"Referer": post_url or f"{DEFAULT_SITE_URL}/"}
                   r1 = session.get(codedew_url, headers=req_headers, timeout=10)
                   if not r1.ok:
-                      return None
+                      return codedew_url if "codedew.com" in lower_url else None
 
                   h1 = r1.text
-                  direct_hub = re.findall(r"href=[\x27\"](https?://[^/]*hubcloud[^\x27\"]+)[\x27\"]", h1, re.I)
+
+                  # 1. Direct HubCloud in page
+                  direct_hub = re.findall(r"href=[\"'](https?://[^/]*hubcloud[^\s\"']+)[\"']", h1, re.I)
                   if direct_hub:
                       return html.unescape(direct_hub[0])
 
-                  step1_links = re.findall(r"data-href=[\x27\"]([^\x27\"]+)[\x27\"]", h1)
-                  if not step1_links:
-                      step1_links = re.findall(r"href=[\x27\"]([^\x27\"]*ad_done=1[^\x27\"]*)[\x27\"]", h1)
-                  if not step1_links:
-                      return None
+                  # 2. Razorshell / MultiQuality embed or downlead ID
+                  rz = re.search(
+                      r"(?:multiquality/\?url=|ziptron\.php/\?|razorshell\.space/(?:embed|downlead)/)([A-Za-z0-9_-]+)",
+                      h1,
+                      re.I,
+                  )
+                  if rz:
+                      return f"https://argon.razorshell.space/downlead/{rz.group(1)}/"
 
-                  step2_url = urljoin(codedew_url, html.unescape(step1_links[0]))
-                  r2 = session.get(step2_url, headers={"Referer": codedew_url}, timeout=10)
-                  if not r2.ok:
-                      return None
+                  # 3. Follow step 1 redirect (ad_done=1 or data-href)
+                  step1_links = re.findall(r"data-href=[\"']([^\"']+)[\"']", h1) or re.findall(
+                      r"href=[\"']([^\"']*ad_done=1[^\"']*)[\"']", h1
+                  )
+                  if step1_links:
+                      step2_url = urljoin(codedew_url, html.unescape(step1_links[0]))
+                      r2 = session.get(step2_url, headers={"Referer": codedew_url}, timeout=10)
+                      if r2.ok:
+                          h2 = r2.text
 
-                  h2 = r2.text
-                  step2_links = re.findall(r"data-href=[\x27\"]([^\x27\"]+)[\x27\"]", h2)
-                  for candidate in step2_links:
-                      target = html.unescape(candidate)
-                      if "hubcloud" in target.lower():
-                          return target
+                          direct_hub2 = re.findall(r"href=[\"'](https?://[^/]*hubcloud[^\s\"']+)[\"']", h2, re.I)
+                          if direct_hub2:
+                              return html.unescape(direct_hub2[0])
 
-                  direct_hub2 = re.findall(r"href=[\x27\"](https?://[^/]*hubcloud[^\x27\"]+)[\x27\"]", h2, re.I)
-                  if direct_hub2:
-                      return html.unescape(direct_hub2[0])
-              except Exception as e:
-                  log(f"  [Warn] Failed resolving codedew link {codedew_url[:50]}: {e}")
+                          rz2 = re.search(
+                              r"(?:multiquality/\?url=|ziptron\.php/\?|razorshell\.space/(?:embed|downlead)/)([A-Za-z0-9_-]+)",
+                              h2,
+                              re.I,
+                          )
+                          if rz2:
+                              return f"https://argon.razorshell.space/downlead/{rz2.group(1)}/"
 
-              return None
+                          for candidate in re.findall(r"data-href=[\"']([^\"']+)[\"']", h2):
+                              target = html.unescape(candidate)
+                              if "hubcloud" in target.lower():
+                                  return target
+                              rz3 = re.search(
+                                  r"(?:multiquality/\?url=|ziptron\.php/\?|razorshell\.space/(?:embed|downlead)/)([A-Za-z0-9_-]+)",
+                                  target,
+                                  re.I,
+                              )
+                              if rz3:
+                                  return f"https://argon.razorshell.space/downlead/{rz3.group(1)}/"
+                              pd3 = re.search(r"(?:pixeldrain\.com/u/|watchbeta/\?url=)([A-Za-z0-9_-]+)", target, re.I)
+                              if pd3:
+                                  return f"https://pixeldrain.net/api/file/{pd3.group(1)}"
+              except Exception:
+                  pass
+
+              return codedew_url if "codedew.com" in lower_url else None
 
           def extract_raw_hubcloud_episode_map(post_html: str):
-              """
-              Pure in-memory regex parser: extracts ({ep_num: [urls]}, {ep_num: title})
-              - STRICTLY EXCLUDES 'Untouched CR' / 'Untouched' 1GB+ uncompressed links.
-              - Extracts real episode name from post text (e.g. 'Episode 01 – The Future Is in Our Hands').
-              """
               episodes_raw = {}
               episodes_titles = {}
+
               blocks = re.split(r"(Episode\s*0*\d+[^<\n]*)", post_html, flags=re.I)
               current_ep = 1
-              found_any_ep_heading = False
+              found_any_ep = False
 
               for block in blocks:
                   ep_m = re.match(r"^Episode\s*0*(\d+)(?:\s*[-–—:]\s*(.+))?", block.strip(), re.I)
@@ -304,56 +287,81 @@ jobs:
                       raw_title = (ep_m.group(2) or "").strip()
                       clean_name = re.sub(r"<[^>]+>", "", raw_title).strip()
                       clean_name = re.sub(r"[\-–—\s]+$", "", clean_name).strip()
-                      clean_name = re.sub(r"\b(?:new!?|hd)\b", "", clean_name, flags=re.I).strip()
+                      clean_name = re.sub(r"\b(?:new!?|hd|part\s*\d+\s*finale)\b", "", clean_name, flags=re.I).strip()
                       clean_name = re.sub(r"[\-–—\s]+$", "", clean_name).strip()
                       if clean_name and "untouched" not in clean_name.lower():
                           episodes_titles[current_ep] = clean_name
-                      found_any_ep_heading = True
+                      found_any_ep = True
                   else:
-                      if not found_any_ep_heading and len(blocks) > 1:
+                      if not found_any_ep and len(blocks) > 1:
                           continue
 
-                      sub_units = re.findall(r"<p[^>]*>.*?</p>|<div[^>]*>.*?</div>|[^<\n]+", block, re.S)
-                      if not sub_units:
-                          sub_units = [block]
+                      ep_section = re.split(
+                          r"<hr\b|<h[1-4]\b|<footer\b|<div\s+class=[\"']entry-comments",
+                          block,
+                          flags=re.I,
+                      )[0]
 
-                      for unit in sub_units:
-                          unit_text = re.sub(r"<[^>]+>", " ", unit).lower()
-                          # CRITICAL: STRICTLY EXCLUDE UNTOUCHED CR LINKS (1GB+ FILES)
-                          if "untouched" in unit_text:
+                      a_tags = re.findall(
+                          r'<a\s+[^>]*href=["\']([^"\']+)["\'][^>]*>([\s\S]*?)</a>',
+                          ep_section,
+                          re.I,
+                      )
+                      valid_links = []
+                      for href, inner in a_tags:
+                          inner_clean = re.sub(r"<[^>]+>", "", inner).strip().lower()
+                          href_lower = href.lower()
+
+                          if not any(d in href_lower for d in ["codedew.com", "hubcloud", "gamerxyt", "razorshell", "pixeldrain"]):
                               continue
 
-                          a_tags = re.findall(
-                              r"<a\s+[^>]*href=[\x27\"](https?://codedew\.com/[^\x27\"]+)[\x27\"][^>]*>((?:(?!</a>)[\s\S])*)</a>",
-                              unit,
-                              re.I,
-                          )
-                          hub_links = [
-                              href
-                              for href, inner in a_tags
-                              if "hubcloud" in re.sub(r"<[^>]+>", "", inner).lower()
-                              and "untouched" not in re.sub(r"<[^>]+>", "", inner).lower()
-                              and "untouched" not in href.lower()
-                          ]
-                          if hub_links:
-                              episodes_raw.setdefault(current_ep, []).extend(hub_links)
+                          if any(bad in inner_clean for bad in ["untouched", "zip", "telegram", "join", "channel"]) or "untouched" in href_lower or href_lower.endswith(".zip"):
+                              continue
 
-              # Single Anime Movie fallback
+                          priority = 5
+                          if "hubcloud" in inner_clean or "hubcloud" in href_lower:
+                              priority = 1
+                          elif "multquality" in inner_clean or "multiquality" in inner_clean:
+                              priority = 2
+                          elif "dlbeta" in inner_clean or "watchbeta" in inner_clean:
+                              priority = 3
+                          elif any(k in inner_clean for k in ["watch", "stream", "download", "fast"]):
+                              priority = 4
+                          elif "mega" in inner_clean:
+                              priority = 9
+
+                          valid_links.append((priority, href))
+
+                      if valid_links:
+                          valid_links.sort(key=lambda x: x[0])
+                          episodes_raw.setdefault(current_ep, []).extend([u for _, u in valid_links])
+
               if not episodes_raw:
                   a_tags = re.findall(
-                      r"<a\s+[^>]*href=[\x27\"](https?://codedew\.com/[^\x27\"]+)[\x27\"][^>]*>((?:(?!</a>)[\s\S])*)</a>",
+                      r'<a\s+[^>]*href=["\']([^"\']+)["\'][^>]*>([\s\S]*?)</a>',
                       post_html,
                       re.I,
                   )
-                  hub_links = [
-                      href
-                      for href, inner in a_tags
-                      if "hubcloud" in re.sub(r"<[^>]+>", "", inner).lower()
-                      and "untouched" not in re.sub(r"<[^>]+>", "", inner).lower()
-                      and "untouched" not in href.lower()
-                  ]
-                  if hub_links:
-                      episodes_raw[1] = hub_links
+                  fallback_links = []
+                  for href, inner in a_tags:
+                      inner_clean = re.sub(r"<[^>]+>", "", inner).strip().lower()
+                      href_lower = href.lower()
+                      if not any(d in href_lower for d in ["codedew.com", "hubcloud", "gamerxyt", "razorshell", "pixeldrain"]):
+                          continue
+                      if any(bad in inner_clean for bad in ["untouched", "zip", "telegram"]) or "untouched" in href_lower or href_lower.endswith(".zip"):
+                          continue
+                      priority = 5
+                      if "hubcloud" in inner_clean or "hubcloud" in href_lower:
+                          priority = 1
+                      elif "multquality" in inner_clean or "multiquality" in inner_clean:
+                          priority = 2
+                      elif "dlbeta" in inner_clean or "watchbeta" in inner_clean:
+                          priority = 3
+                      fallback_links.append((priority, href))
+
+                  if fallback_links:
+                      fallback_links.sort(key=lambda x: x[0])
+                      episodes_raw[1] = [u for _, u in fallback_links]
 
               return episodes_raw, episodes_titles
 
@@ -362,25 +370,28 @@ jobs:
               log(f"  => Found {len(raw_ep_map)} episodes on page.")
 
               for ep_num in sorted(raw_ep_map.keys()):
-                  if ep_num in existing_season_eps and "hubcloud" in existing_season_eps[ep_num].lower():
+                  if ep_num in existing_season_eps and existing_season_eps[ep_num]:
                       resolved_episodes[ep_num] = existing_season_eps[ep_num]
                       log(f"    [Ep {ep_num:02d}] Already in database -> {existing_season_eps[ep_num][:45]}...")
                       continue
 
                   candidates = raw_ep_map[ep_num]
-                  real_hubcloud = None
+                  real_stream = None
                   seen_c = set()
-                  for codedew_link in reversed(candidates):
-                      if codedew_link in seen_c:
+                  for candidate_link in candidates:
+                      if candidate_link in seen_c:
                           continue
-                      seen_c.add(codedew_link)
-                      real_hubcloud = resolve_codedew_to_hubcloud(session, codedew_link, post_url)
-                      if real_hubcloud and "hubcloud" in real_hubcloud.lower():
+                      seen_c.add(candidate_link)
+                      real_stream = resolve_codedew_to_hubcloud(session, candidate_link, post_url)
+                      if real_stream and any(
+                          k in real_stream.lower()
+                          for k in ["hubcloud", "razorshell.space", "pixeldrain", "gamerxyt", "codedew.com"]
+                      ):
                           break
 
-                  if real_hubcloud and "hubcloud" in real_hubcloud.lower():
-                      resolved_episodes[ep_num] = real_hubcloud
-                      log(f"    [Ep {ep_num:02d}] Resolved HubCloud -> {real_hubcloud}")
+                  if real_stream:
+                      resolved_episodes[ep_num] = real_stream
+                      log(f"    [Ep {ep_num:02d}] Resolved Stream -> {real_stream[:60]}...")
                   else:
                       log(f"    [Ep {ep_num:02d}] Link pending on website, skipped.")
 
@@ -432,7 +443,7 @@ jobs:
                       articles = re.findall(r"<article[\s\S]*?</article>", r.text, re.I)
                       for art in articles:
                           m = re.search(
-                              r"href=[\x27\"](https?://(?:www\.)?rareanimes\.mov/[^\x27\"#?]+)[\x27\"]",
+                              r"href=[\"'](https?://(?:www\.)?rareanimes\.mov/[^\s\"'#?]+)[\"']",
                               art,
                               re.I,
                           )
@@ -470,21 +481,15 @@ jobs:
               return collected, seen
 
           def discover_all_seasons_for_series(session, base_url: str, clean_title: str, post_html: str, seen_urls: set):
-              """
-              Discovers ALL companion seasons:
-              1. Scans direct links from post HTML (e.g. naruto-shippuden-season-01..17).
-              2. Queries WordPress search with pagination (pages 1..3).
-              """
               if is_title_blocked(clean_title):
                   return []
 
               discovered = []
               clean_slug = re.sub(r"[^a-z0-9]+", "-", clean_title.lower()).strip("-")
 
-              # Step 1: Scan direct links from the post HTML itself
               if post_html:
                   direct_links = re.findall(
-                      r"href=[\x27\"](https?://(?:www\.)?rareanimes\.mov/[^\x27\"#?]+)[\x27\"]",
+                      r"href=[\"'](https?://(?:www\.)?rareanimes\.mov/[^\s\"'#?]+)[\"']",
                       post_html,
                       re.I,
                   )
@@ -492,11 +497,10 @@ jobs:
                       clean_u = dl.split("?")[0].rstrip("/") + "/"
                       if clean_u in seen_urls or is_title_blocked(clean_u):
                           continue
-                      if (clean_slug in clean_u.lower() or "season" in clean_u.lower()) and re.search(r"season[-_]?0*\d+", clean_u, re.I):
+                      if clean_slug in clean_u.lower() and re.search(r"season[-_]?0*\d+", clean_u, re.I):
                           seen_urls.add(clean_u)
                           discovered.append(clean_u)
 
-              # Step 2: Query WordPress search with pagination
               query = quote_plus(clean_title)
               for p in range(1, 4):
                   search_url = f"{base_url}/?s={query}" if p == 1 else f"{base_url}/page/{p}/?s={query}"
@@ -507,7 +511,7 @@ jobs:
                       articles = re.findall(r"<article[\s\S]*?</article>", r.text, re.I)
                       for art in articles:
                           m = re.search(
-                              r"href=[\x27\"](https?://(?:www\.)?rareanimes\.mov/[^\x27\"#?]+)[\x27\"]",
+                              r"href=[\"'](https?://(?:www\.)?rareanimes\.mov/[^\s\"'#?]+)[\"']",
                               art,
                               re.I,
                           )
@@ -516,8 +520,9 @@ jobs:
                           clean_url = m.group(1).split("?")[0].rstrip("/") + "/"
                           if clean_url in seen_urls or is_title_blocked(clean_url):
                               continue
-                          seen_urls.add(clean_url)
-                          discovered.append(clean_url)
+                          if clean_slug in clean_url.lower() or any(w in clean_url.lower() for w in clean_slug.split("-") if len(w) > 3):
+                              seen_urls.add(clean_url)
+                              discovered.append(clean_url)
                   except Exception:
                       break
 
@@ -530,9 +535,8 @@ jobs:
                   for doc in titles_ref.stream():
                       d = doc.to_dict() or {}
                       t_name = d.get("title", "")
-                      # Auto-delete if user has blocked this title
                       if is_title_blocked(t_name) or is_title_blocked(doc.id):
-                          log(f"  [Auto-Cleanup] Deleting blocked anime from CineNova: '{t_name}' ({doc.id})")
+                          log(f"  [Auto-Cleanup] Deleting non-anime from CineNova: '{t_name}' ({doc.id})")
                           try:
                               for ep_doc in titles_ref.document(doc.id).collection("episodes").stream():
                                   ep_doc.reference.delete()
@@ -560,7 +564,7 @@ jobs:
 
           def main():
               log("=" * 65)
-              log("CineNova Automated Anime Scraper & Auto-Publisher (HubCloud Batch)")
+              log("CineNova Automated Anime Scraper & Auto-Publisher")
               log("=" * 65)
 
               db = init_firestore_db()
@@ -589,18 +593,16 @@ jobs:
 
                   clean_title, season_number, language, year = sanitize_anime_title(details["raw_title"])
                   if is_title_blocked(clean_title) or is_title_blocked(details["raw_title"]):
-                      log(f"  [Filter Blocked] Skipping '{clean_title}' (User filter: Tom & Jerry / Dragon Ball)")
+                      log(f"  [Filter Blocked] Skipping '{clean_title}' (Non-anime / Blocked title)")
                       continue
                   slug = re.sub(r"[^a-z0-9]+", "_", clean_title.lower()).strip("_")
                   doc_id = f"anime_{slug}"[:60]
 
-                  # Parse HubCloud episode buttons from post HTML in memory (0 network calls)
                   raw_ep_map, raw_ep_titles = extract_raw_hubcloud_episode_map(details["html"])
                   if not raw_ep_map:
-                      log(f"  [Skip] No HubCloud links available on page for '{clean_title}'.")
+                      log(f"  [Skip] No stream links available on page for '{clean_title}'.")
                       continue
 
-                  # Discover all companion seasons (e.g. Naruto Shippuden Seasons 1 to 17)
                   if clean_title.lower() not in searched_series_titles:
                       searched_series_titles.add(clean_title.lower())
                       related_urls = discover_all_seasons_for_series(session, DEFAULT_SITE_URL, clean_title, details["html"], seen_urls)
@@ -608,7 +610,6 @@ jobs:
                           log(f"  [Multi-Season Discovery] Found {len(related_urls)} companion season posts for '{clean_title}'!")
                           target_urls.extend(related_urls)
 
-                  # Fetch existing episodes for this specific season only (fast single query)
                   existing_season_eps = {}
                   try:
                       for ep_doc in titles_ref.document(doc_id).collection("episodes").where("seasonNumber", "==", season_number).stream():
@@ -620,7 +621,6 @@ jobs:
                   except Exception:
                       pass
 
-                  # Skip only if all episodes already present in Firestore
                   if existing_season_eps and all(ep in existing_season_eps for ep in raw_ep_map.keys()):
                       log(
                           f"  [Already Added] Anime '{clean_title}' Season {season_number} has all {len(raw_ep_map)} episodes in CineNova. Skipping!"
@@ -632,7 +632,7 @@ jobs:
                   )
 
                   if not episodes_map:
-                      log(f"  [Skip] Could not resolve any HubCloud episodes for '{clean_title}'.")
+                      log(f"  [Skip] Could not resolve any episodes for '{clean_title}'.")
                       continue
 
                   poster = details["poster"] or "drawable://img_hero_nebula"
@@ -714,7 +714,7 @@ jobs:
                   )
 
                   log(
-                      f"  => SUCCESS: Published '{clean_title}' Season {season_number} with {len(valid_ep_ids)} real HubCloud episodes!"
+                      f"  => SUCCESS: Published '{clean_title}' Season {season_number} with {len(valid_ep_ids)} real episodes!"
                   )
 
               log("\n" + "=" * 65)
