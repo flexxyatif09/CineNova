@@ -42,6 +42,8 @@ jobs:
           ANIME_SITE_URL: ${{ github.event.inputs.site_url || 'https://www.rareanimes.mov' }}
           MAX_ANIME_PER_RUN: ${{ github.event.inputs.max_items || '120' }}
           FALLBACK_SITE_URL: "https://animedubhindi.link"
+          ORIGIN_CLEANUP: "unpublish"
+          LINK_RECHECK_BUDGET: "80"
           PYTHONUNBUFFERED: "1"
         run: |
           python3 -u - << 'EOF'
@@ -451,7 +453,7 @@ jobs:
                           if not m:
                               continue
                           clean_url = m.group(1).split("?")[0].rstrip("/") + "/"
-                          if clean_url in seen or is_title_blocked(clean_url):
+                          if clean_url in seen or is_title_blocked(clean_url) or _is_junk_url(clean_url):
                               continue
                           if any(
                               k in clean_url
@@ -496,7 +498,7 @@ jobs:
                   )
                   for dl in direct_links:
                       clean_u = dl.split("?")[0].rstrip("/") + "/"
-                      if clean_u in seen_urls or is_title_blocked(clean_u):
+                      if clean_u in seen_urls or is_title_blocked(clean_u) or _is_junk_url(clean_u):
                           continue
                       if clean_slug in clean_u.lower() and re.search(r"season[-_]?0*\d+", clean_u, re.I):
                           seen_urls.add(clean_u)
@@ -519,9 +521,9 @@ jobs:
                           if not m:
                               continue
                           clean_url = m.group(1).split("?")[0].rstrip("/") + "/"
-                          if clean_url in seen_urls or is_title_blocked(clean_url):
+                          if clean_url in seen_urls or is_title_blocked(clean_url) or _is_junk_url(clean_url):
                               continue
-                          if clean_slug in clean_url.lower() or any(w in clean_url.lower() for w in clean_slug.split("-") if len(w) > 3):
+                          if clean_slug and clean_slug in clean_url.lower():
                               seen_urls.add(clean_url)
                               discovered.append(clean_url)
                   except Exception:
@@ -556,6 +558,10 @@ jobs:
                           "title": t_name,
                           "seasonCount": int(d.get("seasonCount", 1) or 1),
                           "videoUrl": str(d.get("videoUrl", "")),
+                          "authorId": d.get("authorId"),
+                          "originCountry": d.get("originCountry"),
+                          "isPublished": d.get("isPublished", True),
+                          "hiddenByOriginCheck": d.get("hiddenByOriginCheck", False),
                       }
                   log(f"Database ready: {len(existing_anime)} anime series found.")
               except Exception as e:
@@ -731,6 +737,160 @@ jobs:
                       log(f"    [Ep {ep:02d}] Fallback: no working link.")
               return result
 
+          import datetime
+          import difflib
+
+          START_TS = time.time()
+          SOFT_DEADLINE_SEC = 26 * 60
+          RECHECK_DEADLINE_SEC = 18 * 60
+          RECHECK_STATE = {"left": int(os.environ.get("LINK_RECHECK_BUDGET", 80))}
+
+          ANILIST_URL = "https://graphql.anilist.co"
+          ASIAN_ORIGINS = {"JP", "KR", "CN", "TW"}
+          # Jo title galti se block ho jaye use yahan lowercase me daalo, e.g. {"some anime title"}
+          ORIGIN_ALLOWLIST = set()
+          _ORIGIN_CACHE = {}
+
+          def _is_junk_url(u: str) -> bool:
+              return bool(re.search(
+                  r"/(?:feed|comments?)(?:/|$)|/comment-page-\d+|/page/\d+|/category/|/tag/|[?&]replytocom=",
+                  u or "", re.I))
+
+          def _origin_from_media(query_title, media_list):
+              want = _norm_title(query_title)
+              best, best_score = None, 0.0
+              for m in media_list or []:
+                  t = m.get("title") or {}
+                  names = [t.get("romaji"), t.get("english"), t.get("native")] + list(m.get("synonyms") or [])
+                  for n in names:
+                      nn = _norm_title(n or "")
+                      if not nn or not want:
+                          continue
+                      s = difflib.SequenceMatcher(None, want, nn).ratio()
+                      shorter, longer = min(len(want), len(nn)), max(len(want), len(nn))
+                      if shorter >= 6 and shorter / longer >= 0.6 and (want in nn or nn in want):
+                          s = max(s, 0.9)
+                      if s > best_score:
+                          best, best_score = m, s
+              if best is None or best_score < 0.85:
+                  return "unknown", None
+              cc = (best.get("countryOfOrigin") or "").upper()
+              return ("asian" if cc in ASIAN_ORIGINS else "non_asian"), (cc or None)
+
+          def anilist_origin(title: str):
+              # returns (verdict, country): verdict = asian | non_asian | unknown | error
+              if (title or "").strip().lower() in ORIGIN_ALLOWLIST:
+                  return "asian", "JP"
+              key = _norm_title(title)
+              if not key:
+                  return "unknown", None
+              if key in _ORIGIN_CACHE:
+                  return _ORIGIN_CACHE[key]
+              q = re.sub(r"\ball\s+seasons?\b.*", "", title or "", flags=re.I).strip() or title
+              query = ("query($s:String){Page(perPage:6){media(search:$s,type:ANIME)"
+                       "{countryOfOrigin title{romaji english native} synonyms}}}")
+              for _attempt in range(3):
+                  try:
+                      time.sleep(1.1)
+                      r = requests.post(
+                          ANILIST_URL,
+                          json={"query": query, "variables": {"s": q}},
+                          headers={"Content-Type": "application/json", "Accept": "application/json"},
+                          timeout=15,
+                      )
+                  except Exception as e:
+                      log(f"  [Origin][Warn] AniList request failed: {e}")
+                      continue
+                  if r.status_code == 429:
+                      try:
+                          wait = min(int(r.headers.get("Retry-After", "30")), 65)
+                      except Exception:
+                          wait = 30
+                      log(f"  [Origin] AniList rate limit, waiting {wait}s")
+                      time.sleep(wait)
+                      continue
+                  if not r.ok:
+                      log(f"  [Origin][Warn] AniList HTTP {r.status_code}")
+                      return "error", None
+                  try:
+                      media = ((r.json().get("data") or {}).get("Page") or {}).get("media") or []
+                  except Exception:
+                      return "error", None
+                  res = _origin_from_media(q, media)
+                  _ORIGIN_CACHE[key] = res
+                  return res
+              return "error", None
+
+          def link_recheck_due(ep_d: dict, days: int = 7) -> bool:
+              t = (ep_d or {}).get("linkCheckedAt")
+              if not t:
+                  return True
+              try:
+                  age = datetime.datetime.now(datetime.timezone.utc) - t
+                  return age.total_seconds() >= days * 86400
+              except Exception:
+                  return True
+
+          def cleanup_non_anime(titles_ref, existing_anime):
+              mode = os.environ.get("ORIGIN_CLEANUP", "unpublish").strip().lower()
+              if mode not in ("unpublish", "delete"):
+                  log("[Origin-Cleanup] OFF (ORIGIN_CLEANUP not set to unpublish/delete)")
+                  return
+              budget = int(os.environ.get("ORIGIN_CHECK_BUDGET", 120))
+              hidden = restored = checked = 0
+              log(f"[Origin-Cleanup] Checking automation-added titles (mode={mode}, budget={budget})...")
+              for doc_id, info in list(existing_anime.items()):
+                  if info.get("authorId") != "github_automation":
+                      continue  # manual / baaki titles ko kabhi nahi chhedna
+                  title = info.get("title", "")
+                  cc = info.get("originCountry")
+                  if title.strip().lower() in ORIGIN_ALLOWLIST:
+                      cc = "JP"
+                  if not cc:
+                      if budget <= 0:
+                          continue
+                      budget -= 1
+                      checked += 1
+                      verdict, found_cc = anilist_origin(title)
+                      if verdict == "error":
+                          continue
+                      cc = found_cc if found_cc else "UNKNOWN"
+                      try:
+                          titles_ref.document(doc_id).update({"originCountry": cc})
+                      except Exception:
+                          pass
+                      info["originCountry"] = cc
+                  if cc in ASIAN_ORIGINS:
+                      if info.get("hiddenByOriginCheck") and info.get("isPublished") is False:
+                          try:
+                              titles_ref.document(doc_id).update({"isPublished": True, "hiddenByOriginCheck": False})
+                              info["isPublished"] = True
+                              restored += 1
+                              log(f"  [Origin-Cleanup] Restored '{title}' ({cc})")
+                          except Exception:
+                              pass
+                      continue
+                  # non-Asian ya confirm nahi hua
+                  if mode == "delete":
+                      try:
+                          for ep_doc in titles_ref.document(doc_id).collection("episodes").stream():
+                              ep_doc.reference.delete()
+                          titles_ref.document(doc_id).delete()
+                          existing_anime.pop(doc_id, None)
+                          hidden += 1
+                          log(f"  [Origin-Cleanup] Deleted non-anime '{title}' ({cc})")
+                      except Exception as e:
+                          log(f"  [Warn] Delete failed for '{title}': {e}")
+                  elif info.get("isPublished", True) is not False:
+                      try:
+                          titles_ref.document(doc_id).update({"isPublished": False, "hiddenByOriginCheck": True})
+                          info["isPublished"] = False
+                          hidden += 1
+                          log(f"  [Origin-Cleanup] Hidden '{title}' (origin: {cc})")
+                      except Exception as e:
+                          log(f"  [Warn] Hide failed for '{title}': {e}")
+              log(f"[Origin-Cleanup] Done. checked={checked}, hidden/deleted={hidden}, restored={restored}")
+
           def main():
               log("=" * 65)
               log("CineNova Automated Anime Scraper & Auto-Publisher")
@@ -741,6 +901,7 @@ jobs:
               titles_ref = db.collection("titles")
 
               existing_anime = load_fast_existing_anime(titles_ref)
+              cleanup_non_anime(titles_ref, existing_anime)
               target_urls, seen_urls = collect_target_anime_urls(session, DEFAULT_SITE_URL)
               log(f"Target anime series to process: {len(target_urls)}")
 
@@ -751,6 +912,12 @@ jobs:
               while idx < len(target_urls):
                   post_url = target_urls[idx]
                   idx += 1
+                  if time.time() - START_TS > SOFT_DEADLINE_SEC:
+                      log("[Time] Soft deadline reached - stopping this run cleanly (baaki agle run me).")
+                      break
+                  if _is_junk_url(post_url):
+                      log(f"\n[{idx}/{len(target_urls)}] [Junk URL] Skipping {post_url}")
+                      continue
                   if is_title_blocked(post_url):
                       log(f"\n[{idx}/{len(target_urls)}] [Blocked URL] Skipping {post_url}")
                       continue
@@ -767,6 +934,18 @@ jobs:
                   slug = re.sub(r"[^a-z0-9]+", "_", clean_title.lower()).strip("_")
                   doc_id = f"anime_{slug}"[:60]
 
+                  stored_origin = existing_anime.get(doc_id, {}).get("originCountry")
+                  if stored_origin in ASIAN_ORIGINS:
+                      origin_cc = stored_origin
+                  elif stored_origin and clean_title.strip().lower() not in ORIGIN_ALLOWLIST:
+                      log(f"  [Origin] '{clean_title}' was judged non-anime earlier ({stored_origin}) - skipping.")
+                      continue
+                  else:
+                      verdict, origin_cc = anilist_origin(clean_title)
+                      if verdict != "asian":
+                          log(f"  [Origin] '{clean_title}' not confirmed as Japanese/Korean/Chinese anime ({verdict}, {origin_cc}) - skipping.")
+                          continue
+
                   raw_ep_map, raw_ep_titles = extract_raw_hubcloud_episode_map(details["html"])
                   if not raw_ep_map:
                       log(f"  [Info] No stream links on primary page for '{clean_title}' - trying fallback site.")
@@ -779,17 +958,51 @@ jobs:
                           target_urls.extend(related_urls)
 
                   existing_season_eps = {}
+                  existing_ep_refs = {}
+                  dead_eps = set()
+                  frozen_dead = set()
                   try:
                       for ep_doc in titles_ref.document(doc_id).collection("episodes").where("seasonNumber", "==", season_number).stream():
                           ep_d = ep_doc.to_dict() or {}
                           e_num = int(ep_d.get("episodeNumber", 1) or 1)
                           s_url = str(ep_d.get("streamUrl") or ep_d.get("videoUrl") or "").strip()
+                          existing_ep_refs[e_num] = (ep_doc.reference, ep_d)
+                          if ep_d.get("linkStatus") == "dead":
+                              if link_recheck_due(ep_d, days=2):
+                                  dead_eps.add(e_num)
+                              else:
+                                  frozen_dead.add(e_num)
+                              continue
                           if s_url:
                               existing_season_eps[e_num] = s_url
                   except Exception:
                       pass
 
-                  known_eps = set(existing_season_eps.keys())
+                  # Purane saved links ka dead-check (har run me limited budget, 7 din me ek baar)
+                  for e_num in sorted(existing_season_eps.keys()):
+                      ref, ep_d = existing_ep_refs[e_num]
+                      if not link_recheck_due(ep_d):
+                          continue
+                      if RECHECK_STATE["left"] <= 0 or time.time() - START_TS > RECHECK_DEADLINE_SEC:
+                          break
+                      RECHECK_STATE["left"] -= 1
+                      if is_link_alive(session, existing_season_eps[e_num], post_url):
+                          try:
+                              ref.update({"linkStatus": "ok", "linkCheckedAt": firestore.SERVER_TIMESTAMP})
+                          except Exception:
+                              pass
+                      else:
+                          log(f"    [Ep {e_num:02d}] Saved link is DEAD -> re-resolving.")
+                          dead_eps.add(e_num)
+                  for e_num in dead_eps:
+                      existing_season_eps.pop(e_num, None)
+                  for e_num in frozen_dead:
+                      raw_ep_map.pop(e_num, None)
+                  if frozen_dead and not raw_ep_map and not dead_eps and not existing_season_eps:
+                      log(f"  [Dead] '{clean_title}' S{season_number}: sab links dead, thodi der baad dobara try hoga.")
+                      continue
+
+                  known_eps = set(existing_season_eps.keys()) | frozen_dead
                   gap_eps = (set(range(1, max(known_eps) + 1)) - known_eps) if known_eps else set()
                   if gap_eps:
                       log(f"  [Gap] '{clean_title}' S{season_number} missing episodes in DB: {sorted(gap_eps)}")
@@ -826,6 +1039,15 @@ jobs:
                       if fb_eps:
                           log(f"  [Fallback] Added {len(fb_eps)} episodes from AnimeDubHindi.")
 
+                  for _ep in sorted(dead_eps - set(episodes_map.keys())):
+                      _ref = existing_ep_refs.get(_ep)
+                      if _ref:
+                          try:
+                              _ref[0].update({"isPublished": False, "linkStatus": "dead", "linkCheckedAt": firestore.SERVER_TIMESTAMP})
+                              log(f"    [Ep {_ep:02d}] No working link anywhere -> episode hidden (isPublished=False).")
+                          except Exception as _e:
+                              log(f"  [Warn] Could not mark dead episode: {_e}")
+
                   if not episodes_map:
                       log(f"  [Skip] Could not resolve any episodes for '{clean_title}'.")
                       continue
@@ -839,6 +1061,7 @@ jobs:
                   titles_ref.document(doc_id).set(
                       {
                           "authorId": "github_automation",
+                          "originCountry": origin_cc,
                           "type": "series",
                           "title": clean_title[:200],
                           "description": (
@@ -890,6 +1113,7 @@ jobs:
                               "duration": "24m",
                               "videoUrl": stream_url[:500],
                               "streamUrl": stream_url[:500],
+                              **({"linkStatus": "ok", "linkCheckedAt": firestore.SERVER_TIMESTAMP} if ep_num not in existing_season_eps else {}),
                               "isPublished": True,
                               "createdAt": firestore.SERVER_TIMESTAMP,
                               "updatedAt": firestore.SERVER_TIMESTAMP,
@@ -905,6 +1129,7 @@ jobs:
                           "title": clean_title,
                           "seasonCount": max(current_seasons, season_number),
                           "videoUrl": first_stream,
+                          "originCountry": origin_cc,
                       },
                   )
 
