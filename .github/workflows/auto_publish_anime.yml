@@ -383,17 +383,22 @@ jobs:
 
                   candidates = raw_ep_map[ep_num]
                   real_stream = None
+                  weak_stream = None  # razorshell / codedew / gamerxyt jaisa non-direct link (sirf last resort)
                   seen_c = set()
-                  for candidate_link in candidates:
+                  for candidate_link in candidates[:6]:
                       if candidate_link in seen_c:
                           continue
                       seen_c.add(candidate_link)
-                      real_stream = resolve_codedew_to_hubcloud(session, candidate_link, post_url)
-                      if real_stream and any(
-                          k in real_stream.lower()
-                          for k in ["hubcloud", "razorshell.space", "pixeldrain", "gamerxyt", "codedew.com"]
-                      ):
+                      got = resolve_codedew_to_hubcloud(session, candidate_link, post_url)
+                      if not got:
+                          continue
+                      if is_direct_host(got):
+                          real_stream = got      # hubcloud / pixeldrain mil gaya -> ruk jao
                           break
+                      if weak_stream is None and any(k in got.lower() for k in ["razorshell.space", "codedew.com", "gamerxyt"]):
+                          weak_stream = got      # abhi rakho, agle buttons (DLBeta/WatchNow...) bhi try honge
+                  if not real_stream:
+                      real_stream = weak_stream
 
                   if real_stream:
                       resolved_episodes[ep_num] = real_stream
@@ -735,10 +740,19 @@ jobs:
               found += [d for d in _b64_candidates(blob) if is_direct_host(d)]
               return found
 
+          _HOP_SKIP = ("google", "gstatic", "cloudflare", "jsdelivr", "jquery", "bootstrap", "w3.org", "schema.org", "facebook", "twitter", "fonts.")
+
           def _next_hops(text: str, base_url: str):
               blob = html.unescape(text or "").replace("\\/", "/")
               hops = re.findall(r"http-equiv=[\"']refresh[\"'][^>]*content=[\"'][^\"']*url=([^\"'>\s]+)", blob, re.I)
               hops += re.findall(r"(?:location(?:\.href)?\s*=|location\.replace\(|window\.open\()\s*['\"]([^'\"]+)['\"]", blob)
+              if len(text or "") < 6000:
+                  # chhota redirector page: JS me variable se redirect ho sakta hai -> page ke andar ke URLs bhi hop maano
+                  for u in re.findall(r"https?://[^\s'\"<>\\)]+", blob):
+                      low = u.lower()
+                      if any(b in low for b in _HOP_SKIP) or re.search(r"\.(?:js|css|png|jpe?g|gif|svg|ico|woff2?)(?:\?|$)", low):
+                          continue
+                      hops.append(u.rstrip(".,;"))
               try:
                   soup = BeautifulSoup(text or "", "lxml")
                   for a in soup.find_all("a", href=True):
@@ -755,10 +769,26 @@ jobs:
                       out.append(full)
               return out
 
+          _DEBUG_SEEN = {"dumped": False, "hosts": set()}
+
+          def _debug_dead_end(r, depth, url):
+              if depth == 0:
+                  log(f"    [Link][Debug] No hubcloud/pixeldrain link via {urlparse(url).netloc} (final {r.url[:110]}, {len(r.text)} bytes)")
+                  if not _DEBUG_SEEN["dumped"] and len(r.text) < 6000:
+                      _DEBUG_SEEN["dumped"] = True
+                      log("    [Link][Debug] PAGE-URL " + r.url)
+                      log("    [Link][Debug] PAGE-SOURCE-START " + re.sub(r"\s+", " ", r.text)[:3000] + " PAGE-SOURCE-END")
+              else:
+                  host = urlparse(r.url).netloc
+                  if host not in _DEBUG_SEEN["hosts"]:
+                      _DEBUG_SEEN["hosts"].add(host)
+                      hosts = sorted({urlparse(u).netloc for u in re.findall(r"https?://[^\s\"'<>\\)]+", html.unescape(r.text or ""))})[:20]
+                      log(f"    [Link][Debug] Reached {r.url[:110]} ({len(r.text)} bytes). Hosts on page: {', '.join(hosts)}")
+
           def extract_direct_link(session, url: str, referer: str = "", depth: int = 0, seen=None):
               # Wrapper/redirect page se hubcloud/pixeldrain ka direct link nikalta hai (max 3 hop)
               seen = seen if seen is not None else set()
-              if not url or url in seen or depth > 3 or is_blocked_host(url):
+              if not url or url in seen or depth > 3 or len(seen) > 8 or is_blocked_host(url):
                   return None
               seen.add(url)
               if is_direct_host(url):
@@ -777,8 +807,7 @@ jobs:
                   got = extract_direct_link(session, nxt, r.url, depth + 1, seen)
                   if got:
                       return got
-              if depth == 0:
-                  log(f"    [Link][Debug] No hubcloud/pixeldrain link found via {urlparse(url).netloc} (final {r.url[:70]}, {len(r.text)} bytes)")
+              _debug_dead_end(r, depth, url)
               return None
 
           def resolve_fallback_link(session, href: str, referer: str):
@@ -791,8 +820,13 @@ jobs:
                   return got
               return extract_direct_link(session, href, referer)
 
+          FB_STATE = {"disabled": False, "fail_titles": 0, "ok_titles": 0}
+
           def fetch_from_animedubhindi(session, clean_title: str, season_number: int, wanted=None, skip=None):
               skip = skip or set()
+              if FB_STATE["disabled"]:
+                  log("  [Fallback] Is run me band (pehle ke titles me link nahi nikla) - skip.")
+                  return {}
               result = {}
               post_url = fallback_find_post(session, clean_title, season_number)
               if not post_url:
@@ -815,18 +849,31 @@ jobs:
                   log(f"  [Fallback][Warn] {e}")
                   return result
 
+              consec_fail = 0
               for ep in sorted(eps):
                   if ep in skip or (wanted is not None and ep not in wanted):
                       continue
-                  cands = [h for _, _, h in sorted(eps[ep], key=lambda x: (x[0], x[1]))][:6]
+                  if consec_fail >= 3 and not result:
+                      log("  [Fallback] Lagatar 3 episodes me link nahi mila - is title ka baaki skip.")
+                      break
+                  cands = [h for _, _, h in sorted(eps[ep], key=lambda x: (x[0], x[1]))][:4]
                   for href in cands:
                       url = resolve_fallback_link(session, urljoin(r2.url, href), r2.url)
                       if url and link_status(session, url, r2.url) == "ok":
                           result[ep] = url
+                          consec_fail = 0
                           log(f"    [Ep {ep:02d}] Fallback stream -> {url[:60]}...")
                           break
                   else:
+                      consec_fail += 1
                       log(f"    [Ep {ep:02d}] Fallback: no working link.")
+              if result:
+                  FB_STATE["ok_titles"] += 1
+              elif consec_fail >= 3:
+                  FB_STATE["fail_titles"] += 1
+                  if FB_STATE["fail_titles"] >= 4 and FB_STATE["ok_titles"] == 0:
+                      FB_STATE["disabled"] = True
+                      log("  [Fallback] 4 titles me ek bhi link nahi nikla - baaki run ke liye fallback band.")
               return result
 
           import datetime
@@ -1181,6 +1228,16 @@ jobs:
                   current_seasons = existing_anime.get(doc_id, {}).get("seasonCount", 1)
 
                   genres = ["Anime", "Animation", "Action", "Fantasy", "Adventure"]
+                  first_time_fields = {}
+                  if doc_id not in existing_anime:   # sirf bilkul naye title par set hota hai
+                      first_time_fields = {
+                          "rating": 8.8,
+                          "isFeatured": (published_count < 4),
+                          "isTrending": (published_count < 12),
+                          "isNewRelease": True,
+                          "viewsCount": 0,
+                          "createdAt": firestore.SERVER_TIMESTAMP,
+                      }
                   titles_ref.document(doc_id).set(
                       {
                           "authorId": "github_automation",
@@ -1198,22 +1255,17 @@ jobs:
                           "director": "Anime Studio Release",
                           "language": language[:50],
                           "year": year,
-                          "rating": 8.8,
                           "ageRating": "U/A 13+",
                           "duration": f"Season {season_number}",
                           "trailerUrl": first_stream[:500],
                           "videoUrl": first_stream[:500],
                           "subtitles": ["English", "Hindi"],
                           "audioTracks": ["Hindi", "Japanese"],
-                          "isFeatured": (published_count < 4),
-                          "isTrending": (published_count < 12),
-                          "isNewRelease": True,
                           "isUpcoming": False,
                           "isPublished": True,
-                          "viewsCount": 0,
                           "seasonCount": max(current_seasons, season_number),
-                          "createdAt": firestore.SERVER_TIMESTAMP,
                           "updatedAt": firestore.SERVER_TIMESTAMP,
+                          **first_time_fields,
                       },
                       merge=True,
                   )
@@ -1238,7 +1290,7 @@ jobs:
                               "streamUrl": stream_url[:500],
                               **({"linkStatus": "ok", "linkCheckedAt": firestore.SERVER_TIMESTAMP} if ep_num not in existing_season_eps else {}),
                               "isPublished": True,
-                              "createdAt": firestore.SERVER_TIMESTAMP,
+                              **({"createdAt": firestore.SERVER_TIMESTAMP} if ep_num not in existing_ep_refs else {}),
                               "updatedAt": firestore.SERVER_TIMESTAMP,
                           },
                           merge=True,
