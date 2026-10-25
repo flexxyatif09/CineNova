@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       target_title:
-        description: 'Target Movie/Series name (e.g. "Pushpa 2", "Mirzapur" - Leave empty for regular catalog sync)'
+        description: 'Target Movie/Series name (e.g. "Peddi", "Pushpa 2", "Mirzapur" - Leave empty for regular catalog sync)'
         required: false
         default: ''
       weekly_cleanup:
@@ -16,7 +16,7 @@ on:
       site_url:
         description: 'Target Movie Website URL'
         required: false
-        default: 'https://new2.movies4u.garden'
+        default: 'https://new3.movies4u.garden'
       max_items:
         description: 'Kitni movies/series scrape karni hain (Default: 40)'
         required: false
@@ -43,7 +43,7 @@ jobs:
         env:
           FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
           FIREBASE_DATABASE_ID: "ai-studio-android-devbuild-a9589065-5570-4074-a613-1c0430bf6841"
-          MOVIES_SITE_URL: ${{ github.event.inputs.site_url || vars.MOVIES_SITE_URL || 'https://new2.movies4u.garden' }}
+          MOVIES_SITE_URL: ${{ github.event.inputs.site_url || vars.MOVIES_SITE_URL || 'https://new3.movies4u.garden' }}
           MAX_MOVIES_PER_RUN: ${{ github.event.inputs.max_items || '40' }}
           TARGET_TITLE: ${{ github.event.inputs.target_title || '' }}
           RUN_WEEKLY_CLEANUP: ${{ github.event.inputs.weekly_cleanup || 'false' }}
@@ -159,6 +159,7 @@ jobs:
                   maxsplit=1,
                   flags=re.I,
               )[0]
+              clean = re.sub(r"\b(?:NF|AMZN|DSNP|ZEE5|JIO)\b", "", clean, flags=re.I)
               for opener, closer in [("(", ")"), ("[", "]"), ("{", "}")]:
                   if opener in clean and closer not in clean:
                       clean = clean.split(opener, 1)[0]
@@ -220,14 +221,16 @@ jobs:
 
 
           def is_same_title(title_a: str, title_b: str) -> bool:
-              if compact_slug(title_a) and compact_slug(title_a) == compact_slug(title_b):
+              slug_a = compact_slug(title_a)
+              slug_b = compact_slug(title_b)
+              if slug_a and slug_b and (slug_a == slug_b or slug_a in slug_b or slug_b in slug_a):
                   return True
               words_a = extract_significant_words(title_a)
               words_b = extract_significant_words(title_b)
               if not words_a or not words_b:
                   return False
               overlap = len(words_a & words_b) / max(1, len(words_a))
-              return overlap >= 0.65
+              return overlap >= 0.5
 
 
           def extract_genres_and_rating(post_html: str, title: str):
@@ -448,6 +451,7 @@ jobs:
 
 
           def search_real_post(session, base_url: str, title: str, require_series: bool = False):
+              """Searches lookup.php with fallback to HTML search."""
               search_terms = [title]
               base_title = re.sub(r"[:\-–].*$", "", title).strip()
               if base_title and base_title != title:
@@ -459,27 +463,33 @@ jobs:
                       r = session.get(lookup_url, timeout=12)
                       if not r.ok:
                           continue
-                      hits = r.json()
-                      if not isinstance(hits, list):
-                          continue
+                      res_data = r.json()
+                      if isinstance(res_data, dict):
+                          hits = res_data.get("hits") or []
+                      elif isinstance(res_data, list):
+                          hits = res_data
+                      else:
+                          hits = []
 
                       for hit in hits:
                           post_title = hit.get("post_title") or ""
-                          permalink = hit.get("permalink") or ""
-                          if not permalink:
+                          rel_permalink = hit.get("permalink") or ""
+                          if not rel_permalink:
                               continue
+                          full_permalink = urljoin(base_url, rel_permalink)
 
-                          is_series = bool(SERIES_PATTERN.search(post_title)) or bool(SERIES_PATTERN.search(permalink))
+                          is_series = bool(SERIES_PATTERN.search(post_title)) or bool(SERIES_PATTERN.search(full_permalink))
                           if require_series and not is_series:
                               continue
 
                           if is_same_title(title, post_title):
-                              pr = session.get(permalink, timeout=15)
+                              pr = session.get(full_permalink, timeout=15)
                               if pr.ok:
-                                  return permalink, pr.text, post_title
+                                  return full_permalink, pr.text, post_title
                   except Exception:
                       continue
 
+              # Fallback to WordPress ?s= search
               try:
                   s_url = f"{base_url}/?s={quote_plus(title)}"
                   r = session.get(s_url, timeout=15)
@@ -488,7 +498,7 @@ jobs:
                       for art in soup.find_all("article"):
                           a_tag = art.select_one("h2 a, h3 a, .entry-title a") or art.find("a", href=True)
                           if a_tag and a_tag.get("href"):
-                              cand_url = a_tag["href"].strip()
+                              cand_url = urljoin(base_url, a_tag["href"].strip())
                               cand_title = a_tag.get_text(" ", strip=True)
                               if is_same_title(title, cand_title) or compact_slug(title) in compact_slug(cand_title):
                                   pr = session.get(cand_url, timeout=15)
