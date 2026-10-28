@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       target_title:
-        description: 'Target Movie/Series name (e.g. "VisionQuest", "Peddi", "Pushpa 2" - Leave empty for regular catalog sync)'
+        description: 'Target Movie/Series name (e.g. "VisionQuest", "Peddi" - Leave empty to auto-sync catalog & fix all GDFlix)'
         required: false
         default: ''
       weekly_cleanup:
@@ -56,13 +56,8 @@ jobs:
           - Strict Quality Control:
             * STRICT 720p: Strictly extracts 720p links for both movies and series.
             * STRICT HubCloud Priority: Always picks Hub-Cloud [DD] over GDFlix.
-          - Optimized for Quota Safety:
-            * Fast Quota-Saver Mode: Normal runs only check newly scraped items (< 50 reads).
-            * Weekly Deep Cleanup: Full database scan & duplicate removal runs once a week (Sundays).
-            * Targeted Single Title Mode: Run with TARGET_TITLE to search and add ONLY that specific
-              movie or series in seconds (< 5 reads/writes, 0.01% quota used).
-            * Dynamic Series Episode Sync: Detects new episodes (e.g. Ep 5, Ep 6) and automatically
-              adds missing episodes while saving quota for already-synced movies.
+            * AUTO GDFLIX MASS-FIXER: Automatically scans all existing Web Series in Firestore
+              and replaces any GDFlix episode links with genuine 720p HubCloud links.
           - Configured for: https://new3.movies4u.garden
           """
 
@@ -589,6 +584,93 @@ jobs:
               return docs_info
 
 
+          def fix_all_gdflix_titles_in_firestore(titles_ref, session, base_url: str):
+              """
+              Scans Firestore for any Web Series that contains 'gdflix' links
+              in its videoUrl or episodes, and automatically replaces all of them
+              with pure 720p HubCloud links from Movies4u.
+              """
+              print("=" * 65)
+              print("[GDFlix Auto-Fixer] Scanning Web Series in Firestore for GDFlix links...")
+              print("=" * 65)
+
+              try:
+                  series_docs = list(titles_ref.where("type", "==", "series").stream())
+              except Exception as e:
+                  print(f"[Warn] Querying series failed: {e}. Falling back to full scan...")
+                  series_docs = [d for d in titles_ref.stream() if (d.to_dict() or {}).get("type") == "series"]
+
+              print(f"Found {len(series_docs)} total Web Series in database to inspect.")
+
+              fixed_series_count = 0
+              total_episodes_fixed = 0
+
+              for s_doc in series_docs:
+                  d = s_doc.to_dict() or {}
+                  raw_title = str(d.get("title", "")).strip()
+                  doc_id = s_doc.id
+                  video_url = str(d.get("videoUrl", "")).lower()
+
+                  has_gdflix = "gdflix" in video_url
+
+                  if not has_gdflix:
+                      try:
+                          first_eps = list(s_doc.reference.collection("episodes").limit(1).stream())
+                          if first_eps:
+                              ep_url = str(first_eps[0].to_dict().get("videoUrl", "")).lower()
+                              if "gdflix" in ep_url:
+                                  has_gdflix = True
+                      except Exception:
+                          pass
+
+                  if not has_gdflix:
+                      continue
+
+                  print(f"\n[Fixing GDFlix Series] '{raw_title}' ({doc_id}) -> Fetching 720p HubCloud from {base_url}...")
+
+                  post_url, post_html, found_title = search_real_post(session, base_url, raw_title, require_series=True)
+                  if not post_url or not post_html:
+                      clean_t = sanitize_display_title(raw_title)
+                      post_url, post_html, found_title = search_real_post(session, base_url, clean_t, require_series=True)
+
+                  if not post_url or not post_html:
+                      print(f"  [Skip] Could not find post on {base_url} for '{raw_title}'")
+                      continue
+
+                  episodes_map = extract_all_episodes(session, post_url, post_html)
+                  if not episodes_map:
+                      print(f"  [Skip] No valid 720p HubCloud episodes found for '{raw_title}'")
+                      continue
+
+                  hc_eps = {k: u for (k, u) in episodes_map.items() if "gdflix" not in u.lower()}
+                  if not hc_eps:
+                      print(f"  [Skip] Extracted links still had GDFlix for '{raw_title}'")
+                      continue
+
+                  poster = str(d.get("poster", "") or "drawable://img_hero_nebula")
+                  sorted_keys = sorted(hc_eps.keys())
+                  first_ep_link = hc_eps[sorted_keys[0]]
+
+                  ep_count, _ = sync_and_clean_series_episodes(
+                      titles_ref, doc_id, raw_title, poster, hc_eps
+                  )
+
+                  s_doc.reference.update({
+                      "videoUrl": first_ep_link,
+                      "trailerUrl": first_ep_link,
+                      "episodesCount": ep_count,
+                      "updatedAt": firestore.SERVER_TIMESTAMP,
+                  })
+
+                  fixed_series_count += 1
+                  total_episodes_fixed += ep_count
+                  print(f"  [SUCCESS] All {ep_count} episodes of '{raw_title}' successfully replaced with 720p HubCloud!")
+
+              print("=" * 65)
+              print(f"[GDFlix Auto-Fixer] Completed! Fixed {fixed_series_count} Series ({total_episodes_fixed} episodes updated to HubCloud).")
+              print("=" * 65)
+
+
           def process_single_target(titles_ref, session, base_url: str, target_name: str):
               print("=" * 65)
               print(f"[Targeted Mode] Searching & Adding ONLY: '{target_name}'")
@@ -773,6 +855,10 @@ jobs:
                   print("[Fast Quota-Saver Mode] Skipping full database scan to conserve daily Firestore quota.")
                   print("  (Deep database cleanup is scheduled once a week on Sundays).")
 
+              # Always scan and auto-fix any Web Series in Firestore that currently have GDFlix links!
+              # Replaces all existing GDFlix links with pure 720p HubCloud links.
+              fix_all_gdflix_titles_in_firestore(titles_ref, session, DEFAULT_SITE_URL)
+
               print(f"Scraping up to {MAX_MOVIES_PER_RUN} recent posts from {DEFAULT_SITE_URL} ...")
               posts = fetch_recent_posts(session, DEFAULT_SITE_URL, MAX_MOVIES_PER_RUN)
               print(f"Found {len(posts)} catalog posts to process.")
@@ -799,8 +885,8 @@ jobs:
                       stored_raw_title = str(d.get("rawTitle", "")).strip()
                       stored_ep_count = int(d.get("episodesCount", 0) or 0)
 
-                      # For Movies: if videoUrl exists, movie is already complete! Skip.
-                      if content_type == "movie" and video_url and len(video_url) > 10:
+                      # For Movies: if videoUrl exists and is not gdflix, skip.
+                      if content_type == "movie" and video_url and len(video_url) > 10 and "gdflix" not in video_url.lower():
                           print(f"  [Already Synced Movie] '{clean_title}' ({year}) exists with stream link. Skipping.")
                           skipped_count += 1
                           continue
