@@ -1,30 +1,33 @@
 name: CineNova Auto-Publish Anime Series & Movies
 
 on:
-  # Har 3 ghante me automatically chalega (100% Free on GitHub Actions)
   schedule:
     - cron: '0 */3 * * *'
-  # GitHub Actions tab se 1-click manual run ke liye
   workflow_dispatch:
     inputs:
+      target_title:
+        description: 'Target Anime Name or URL (e.g. "Zom 100", "Solo Leveling" - Leave empty to sync catalog & auto-fix Razorshell)'
+        required: false
+        default: ''
+      weekly_cleanup:
+        description: 'Run deep AniList origin audit & full database clean? (true/false)'
+        required: false
+        default: 'false'
       site_url:
-        description: 'Target Anime Website URL (Default: https://www.rareanimes.mov)'
+        description: 'Target Anime Website URL'
         required: false
         default: 'https://www.rareanimes.mov'
       max_items:
-        description: 'Kitne anime posts scrape karne hain (Default: 120)'
+        description: 'Kitne anime posts scrape karne hain (Default: 45)'
         required: false
-        default: '120'
+        default: '45'
 
 jobs:
   sync-anime-to-firestore:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 25
 
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
@@ -35,30 +38,34 @@ jobs:
           pip install --upgrade pip
           pip install requests beautifulsoup4 cloudscraper firebase-admin lxml
 
-      - name: Scrape Anime Series (All Seasons/Episodes) & Auto-Publish
+      - name: Run CineNova Anime Engine
+        shell: python
         env:
           FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
           FIREBASE_DATABASE_ID: "ai-studio-android-devbuild-a9589065-5570-4074-a613-1c0430bf6841"
           ANIME_SITE_URL: ${{ github.event.inputs.site_url || 'https://www.rareanimes.mov' }}
-          MAX_ANIME_PER_RUN: ${{ github.event.inputs.max_items || '120' }}
+          MAX_ANIME_PER_RUN: ${{ github.event.inputs.max_items || '45' }}
+          TARGET_TITLE: ${{ github.event.inputs.target_title || '' }}
+          RUN_WEEKLY_CLEANUP: ${{ github.event.inputs.weekly_cleanup || 'false' }}
           FALLBACK_SITE_URL: "https://animedubhindi.link"
           ORIGIN_CLEANUP: "unpublish"
           LINK_RECHECK_BUDGET: "80"
           DIRECT_HOSTS: "hubcloud,pixeldrain"
-          KEEP_WRAPPER_LINKS: "false"
           BLOCKED_LINK_HOSTS: "razorshell"
           PYTHONUNBUFFERED: "1"
         run: |
-          python3 -u - << 'EOF'
           #!/usr/bin/env python3
+          import base64
+          import datetime
+          import difflib
           import html
           import json
           import os
           import re
           import sys
           import time
+          from urllib.parse import quote_plus, urljoin, urlparse, unquote
           import warnings
-          from urllib.parse import quote_plus, urljoin
 
           warnings.filterwarnings("ignore")
 
@@ -68,7 +75,7 @@ jobs:
               sys.stderr.reconfigure(line_buffering=True)
 
           import firebase_admin
-          from bs4 import BeautifulSoup
+          from bs4 import BeautifulSoup, NavigableString
           from firebase_admin import credentials, firestore
           import requests
 
@@ -77,13 +84,19 @@ jobs:
               "FIREBASE_DATABASE_ID",
               "ai-studio-android-devbuild-a9589065-5570-4074-a613-1c0430bf6841",
           )
-          MAX_ANIME_PER_RUN = int(os.environ.get("MAX_ANIME_PER_RUN", 120))
+          MAX_ANIME_PER_RUN = int(os.environ.get("MAX_ANIME_PER_RUN", 45))
+          TARGET_TITLE = os.environ.get("TARGET_TITLE", "").strip()
+          RUN_WEEKLY_CLEANUP = os.environ.get("RUN_WEEKLY_CLEANUP", "false").lower() in ("true", "1", "yes")
+          FALLBACK_SITE_URL = os.environ.get("FALLBACK_SITE_URL", "https://animedubhindi.link").rstrip("/")
 
           USER_AGENT = (
               "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) "
               "AppleWebKit/537.36 (KHTML, like Gecko) "
               "Chrome/126.0.0.0 Mobile Safari/537.36"
           )
+
+          DIRECT_HOSTS = tuple(h.strip().lower() for h in os.environ.get("DIRECT_HOSTS", "hubcloud,pixeldrain").split(",") if h.strip())
+          BLOCKED_LINK_HOSTS = tuple(h.strip().lower() for h in os.environ.get("BLOCKED_LINK_HOSTS", "razorshell").split(",") if h.strip())
 
           BLOCKED_KEYWORDS = [
               "power ranger", "power rangers", "dino fury", "cosmic fury", "beast morphers",
@@ -117,6 +130,44 @@ jobs:
 
           def log(msg: str):
               print(msg, flush=True)
+
+          def is_direct_host(url: str) -> bool:
+              try:
+                  host = urlparse((url or "").strip()).netloc.lower()
+              except Exception:
+                  return False
+              return bool(host) and any(h in host for h in DIRECT_HOSTS)
+
+          def is_blocked_host(url: str) -> bool:
+              try:
+                  host = urlparse((url or "").strip()).netloc.lower()
+              except Exception:
+                  return False
+              return bool(host) and any(h in host for h in BLOCKED_LINK_HOSTS)
+
+          def is_link_alive(session, url: str, referer: str = ""):
+              try:
+                  r = session.get(url, timeout=12, stream=True, allow_redirects=True,
+                                  headers={"Referer": referer or f"{DEFAULT_SITE_URL}/"})
+              except Exception:
+                  return False
+              try:
+                  if r.status_code in (404, 410):
+                      return False
+                  if "text/html" in r.headers.get("Content-Type", "").lower():
+                      body = next(r.iter_content(60000), b"").decode("utf-8", "ignore").lower()
+                      if any(m in body for m in ("file not found", "file has been removed", "file removed", "has been deleted", "link expired", "invalid link")):
+                          return False
+                  return True
+              finally:
+                  r.close()
+
+          def link_status(session, url: str, referer: str = "") -> str:
+              if is_blocked_host(url):
+                  return "blocked"
+              if not is_direct_host(url):
+                  return "not_direct"
+              return "ok" if is_link_alive(session, url, referer) else "dead"
 
           def create_http_session():
               try:
@@ -208,75 +259,47 @@ jobs:
               return display_title, season_number, language, year
 
           def resolve_codedew_to_hubcloud(session, codedew_url: str, post_url: str = ""):
-              if not codedew_url:
+              if not codedew_url or is_blocked_host(codedew_url):
                   return None
 
               lower_url = codedew_url.lower()
-              if any(k in lower_url for k in ["hubcloud", "razorshell.space", "pixeldrain.net", "gamerxyt"]):
+              if "hubcloud" in lower_url or "pixeldrain.net" in lower_url:
                   return codedew_url
 
               try:
                   req_headers = {"Referer": post_url or f"{DEFAULT_SITE_URL}/"}
                   r1 = session.get(codedew_url, headers=req_headers, timeout=10)
                   if not r1.ok:
-                      return codedew_url if "codedew.com" in lower_url else None
+                      return None
 
                   h1 = r1.text
-
-                  # 1. Direct HubCloud in page
-                  direct_hub = re.findall(r"href=[\"'](https?://[^/]*hubcloud[^\s\"']+)[\"']", h1, re.I)
+                  direct_hub = re.findall(r'href=["\'](https?://[^/]*hubcloud[^\s"\']+)["\']', h1, re.I)
                   if direct_hub:
                       return html.unescape(direct_hub[0])
 
-                  # 2. Razorshell / MultiQuality embed or downlead ID
-                  rz = re.search(
-                      r"(?:multiquality/\?url=|ziptron\.php/\?|razorshell\.space/(?:embed|downlead)/)([A-Za-z0-9_-]+)",
-                      h1,
-                      re.I,
-                  )
-                  if rz:
-                      return f"https://argon.razorshell.space/downlead/{rz.group(1)}/"
-
-                  # 3. Follow step 1 redirect (ad_done=1 or data-href)
-                  step1_links = re.findall(r"data-href=[\"']([^\"']+)[\"']", h1) or re.findall(
-                      r"href=[\"']([^\"']*ad_done=1[^\"']*)[\"']", h1
+                  step1_links = re.findall(r'data-href=["\']([^"\']+)["\']', h1) or re.findall(
+                      r'href=["\']([^"\']*ad_done=1[^"\']*)["\']', h1
                   )
                   if step1_links:
                       step2_url = urljoin(codedew_url, html.unescape(step1_links[0]))
                       r2 = session.get(step2_url, headers={"Referer": codedew_url}, timeout=10)
                       if r2.ok:
                           h2 = r2.text
-
-                          direct_hub2 = re.findall(r"href=[\"'](https?://[^/]*hubcloud[^\s\"']+)[\"']", h2, re.I)
+                          direct_hub2 = re.findall(r'href=["\'](https?://[^/]*hubcloud[^\s"\']+)["\']', h2, re.I)
                           if direct_hub2:
                               return html.unescape(direct_hub2[0])
 
-                          rz2 = re.search(
-                              r"(?:multiquality/\?url=|ziptron\.php/\?|razorshell\.space/(?:embed|downlead)/)([A-Za-z0-9_-]+)",
-                              h2,
-                              re.I,
-                          )
-                          if rz2:
-                              return f"https://argon.razorshell.space/downlead/{rz2.group(1)}/"
-
-                          for candidate in re.findall(r"data-href=[\"']([^\"']+)[\"']", h2):
+                          for candidate in re.findall(r'data-href=["\']([^"\']+)["\']', h2):
                               target = html.unescape(candidate)
                               if "hubcloud" in target.lower():
                                   return target
-                              rz3 = re.search(
-                                  r"(?:multiquality/\?url=|ziptron\.php/\?|razorshell\.space/(?:embed|downlead)/)([A-Za-z0-9_-]+)",
-                                  target,
-                                  re.I,
-                              )
-                              if rz3:
-                                  return f"https://argon.razorshell.space/downlead/{rz3.group(1)}/"
-                              pd3 = re.search(r"(?:pixeldrain\.com/u/|watchbeta/\?url=)([A-Za-z0-9_-]+)", target, re.I)
+                              pd3 = re.search(r'(?:pixeldrain\.com/u/|watchbeta/\?url=)([A-Za-z0-9_-]+)', target, re.I)
                               if pd3:
                                   return f"https://pixeldrain.net/api/file/{pd3.group(1)}"
               except Exception:
                   pass
 
-              return codedew_url if "codedew.com" in lower_url else None
+              return None
 
           def extract_raw_hubcloud_episode_map(post_html: str):
               episodes_raw = {}
@@ -318,7 +341,7 @@ jobs:
                           inner_clean = re.sub(r"<[^>]+>", "", inner).strip().lower()
                           href_lower = href.lower()
 
-                          if not any(d in href_lower for d in ["codedew.com", "hubcloud", "gamerxyt", "razorshell", "pixeldrain"]):
+                          if not any(d in href_lower for d in ["codedew.com", "hubcloud", "gamerxyt", "pixeldrain"]):
                               continue
 
                           if any(bad in inner_clean for bad in ["untouched", "zip", "telegram", "join", "channel"]) or "untouched" in href_lower or href_lower.endswith(".zip"):
@@ -331,278 +354,13 @@ jobs:
                               priority = 2
                           elif "dlbeta" in inner_clean or "watchbeta" in inner_clean:
                               priority = 3
-                          elif any(k in inner_clean for k in ["watch", "stream", "download", "fast"]):
-                              priority = 4
-                          elif "mega" in inner_clean:
-                              priority = 9
-
                           valid_links.append((priority, href))
 
                       if valid_links:
                           valid_links.sort(key=lambda x: x[0])
                           episodes_raw.setdefault(current_ep, []).extend([u for _, u in valid_links])
 
-              if not episodes_raw:
-                  a_tags = re.findall(
-                      r'<a\s+[^>]*href=["\']([^"\']+)["\'][^>]*>([\s\S]*?)</a>',
-                      post_html,
-                      re.I,
-                  )
-                  fallback_links = []
-                  for href, inner in a_tags:
-                      inner_clean = re.sub(r"<[^>]+>", "", inner).strip().lower()
-                      href_lower = href.lower()
-                      if not any(d in href_lower for d in ["codedew.com", "hubcloud", "gamerxyt", "razorshell", "pixeldrain"]):
-                          continue
-                      if any(bad in inner_clean for bad in ["untouched", "zip", "telegram"]) or "untouched" in href_lower or href_lower.endswith(".zip"):
-                          continue
-                      priority = 5
-                      if "hubcloud" in inner_clean or "hubcloud" in href_lower:
-                          priority = 1
-                      elif "multquality" in inner_clean or "multiquality" in inner_clean:
-                          priority = 2
-                      elif "dlbeta" in inner_clean or "watchbeta" in inner_clean:
-                          priority = 3
-                      fallback_links.append((priority, href))
-
-                  if fallback_links:
-                      fallback_links.sort(key=lambda x: x[0])
-                      episodes_raw[1] = [u for _, u in fallback_links]
-
               return episodes_raw, episodes_titles
-
-          def resolve_anime_episodes(session, raw_ep_map: dict, existing_season_eps: dict, post_url: str):
-              resolved_episodes = {}
-              log(f"  => Found {len(raw_ep_map)} episodes on page.")
-
-              for ep_num in sorted(raw_ep_map.keys()):
-                  if ep_num in existing_season_eps and existing_season_eps[ep_num]:
-                      resolved_episodes[ep_num] = existing_season_eps[ep_num]
-                      log(f"    [Ep {ep_num:02d}] Already in database -> {existing_season_eps[ep_num][:45]}...")
-                      continue
-
-                  candidates = raw_ep_map[ep_num]
-                  real_stream = None
-                  weak_stream = None  # razorshell / codedew / gamerxyt jaisa non-direct link (sirf last resort)
-                  seen_c = set()
-                  for candidate_link in candidates[:6]:
-                      if candidate_link in seen_c:
-                          continue
-                      seen_c.add(candidate_link)
-                      got = resolve_codedew_to_hubcloud(session, candidate_link, post_url)
-                      if not got:
-                          continue
-                      if is_direct_host(got):
-                          real_stream = got      # hubcloud / pixeldrain mil gaya -> ruk jao
-                          break
-                      if weak_stream is None and any(k in got.lower() for k in ["razorshell.space", "codedew.com", "gamerxyt"]):
-                          weak_stream = got      # abhi rakho, agle buttons (DLBeta/WatchNow...) bhi try honge
-                  if not real_stream:
-                      real_stream = weak_stream
-
-                  if real_stream:
-                      resolved_episodes[ep_num] = real_stream
-                      log(f"    [Ep {ep_num:02d}] Resolved Stream -> {real_stream[:60]}...")
-                  else:
-                      log(f"    [Ep {ep_num:02d}] Link pending on website, skipped.")
-
-              return resolved_episodes
-
-          def fetch_anime_post_details(session, post_url: str):
-              try:
-                  r = session.get(post_url, timeout=12)
-                  if not r.ok:
-                      return None
-                  html_text = r.text
-                  soup = BeautifulSoup(html_text, "lxml")
-
-                  title_tag = soup.find("h1") or soup.find("title")
-                  raw_title = title_tag.get_text(" ", strip=True) if title_tag else ""
-
-                  og_img = soup.find("meta", property="og:image")
-                  poster = og_img["content"].strip() if og_img and og_img.get("content") else ""
-
-                  og_desc = soup.find("meta", property="og:description")
-                  synopsis = og_desc["content"].strip() if og_desc and og_desc.get("content") else ""
-
-                  return {
-                      "url": post_url,
-                      "html": html_text,
-                      "raw_title": raw_title,
-                      "poster": poster,
-                      "synopsis": synopsis,
-                  }
-              except Exception as e:
-                  log(f"  [Warn] Failed fetching post {post_url}: {e}")
-                  return None
-
-          def collect_target_anime_urls(session, base_url: str):
-              anime_cat_url = f"{base_url}/category/animes"
-              log(f"Scanning pure Anime category across {anime_cat_url}/ pages...")
-              seen = set()
-              collected = []
-
-              pages_to_check = [f"{anime_cat_url}/"] + [f"{anime_cat_url}/page/{i}/" for i in range(2, 31)]
-              for page_url in pages_to_check:
-                  if len(collected) >= MAX_ANIME_PER_RUN:
-                      break
-                  try:
-                      r = session.get(page_url, timeout=12)
-                      if not r.ok:
-                          continue
-
-                      articles = re.findall(r"<article[\s\S]*?</article>", r.text, re.I)
-                      for art in articles:
-                          m = re.search(
-                              r"href=[\"'](https?://(?:www\.)?rareanimes\.mov/[^\s\"'#?]+)[\"']",
-                              art,
-                              re.I,
-                          )
-                          if not m:
-                              continue
-                          clean_url = m.group(1).split("?")[0].rstrip("/") + "/"
-                          if clean_url in seen or is_title_blocked(clean_url) or _is_junk_url(clean_url):
-                              continue
-                          if any(
-                              k in clean_url
-                              for k in (
-                                  "all-anime-cartoon",
-                                  "wp-content",
-                                  "wp-json",
-                                  "feed",
-                                  "comments",
-                                  "home",
-                                  "category",
-                                  "contact",
-                                  "privacy",
-                                  "dmca",
-                                  "disclaimer",
-                                  "about",
-                              )
-                          ):
-                              continue
-                          seen.add(clean_url)
-                          collected.append(clean_url)
-                          if len(collected) >= MAX_ANIME_PER_RUN:
-                              break
-                  except Exception as e:
-                      log(f"  [Warn] Error checking page {page_url}: {e}")
-
-              log(f"Total pure anime posts collected automatically: {len(collected)}")
-              return collected, seen
-
-          def discover_all_seasons_for_series(session, base_url: str, clean_title: str, post_html: str, seen_urls: set):
-              if is_title_blocked(clean_title):
-                  return []
-
-              discovered = []
-              clean_slug = re.sub(r"[^a-z0-9]+", "-", clean_title.lower()).strip("-")
-
-              if post_html:
-                  direct_links = re.findall(
-                      r"href=[\"'](https?://(?:www\.)?rareanimes\.mov/[^\s\"'#?]+)[\"']",
-                      post_html,
-                      re.I,
-                  )
-                  for dl in direct_links:
-                      clean_u = dl.split("?")[0].rstrip("/") + "/"
-                      if clean_u in seen_urls or is_title_blocked(clean_u) or _is_junk_url(clean_u):
-                          continue
-                      if clean_slug in clean_u.lower() and re.search(r"season[-_]?0*\d+", clean_u, re.I):
-                          seen_urls.add(clean_u)
-                          discovered.append(clean_u)
-
-              query = quote_plus(clean_title)
-              for p in range(1, 4):
-                  search_url = f"{base_url}/?s={query}" if p == 1 else f"{base_url}/page/{p}/?s={query}"
-                  try:
-                      r = session.get(search_url, timeout=10)
-                      if not r.ok:
-                          continue
-                      articles = re.findall(r"<article[\s\S]*?</article>", r.text, re.I)
-                      for art in articles:
-                          m = re.search(
-                              r"href=[\"'](https?://(?:www\.)?rareanimes\.mov/[^\s\"'#?]+)[\"']",
-                              art,
-                              re.I,
-                          )
-                          if not m:
-                              continue
-                          clean_url = m.group(1).split("?")[0].rstrip("/") + "/"
-                          if clean_url in seen_urls or is_title_blocked(clean_url) or _is_junk_url(clean_url):
-                              continue
-                          if clean_slug and clean_slug in clean_url.lower():
-                              seen_urls.add(clean_url)
-                              discovered.append(clean_url)
-                  except Exception:
-                      break
-
-              return discovered
-
-          def load_fast_existing_anime(titles_ref):
-              log("Checking existing anime database...")
-              existing_anime = {}
-              try:
-                  for doc in titles_ref.stream():
-                      d = doc.to_dict() or {}
-                      t_name = d.get("title", "")
-                      if is_title_blocked(t_name) or is_title_blocked(doc.id):
-                          log(f"  [Auto-Cleanup] Deleting non-anime from CineNova: '{t_name}' ({doc.id})")
-                          try:
-                              for ep_doc in titles_ref.document(doc.id).collection("episodes").stream():
-                                  ep_doc.reference.delete()
-                              doc.reference.delete()
-                              log(f"  [Auto-Cleanup] Successfully removed '{t_name}'.")
-                          except Exception as ce:
-                              log(f"  [Warn] Failed deleting blocked document: {ce}")
-                          continue
-
-                      g = d.get("genres", [])
-                      if not ("Anime" in g or "Animation" in g or doc.id.startswith("anime_")):
-                          continue
-
-                      existing_anime[doc.id] = {
-                          "id": doc.id,
-                          "title": t_name,
-                          "seasonCount": int(d.get("seasonCount", 1) or 1),
-                          "videoUrl": str(d.get("videoUrl", "")),
-                          "authorId": d.get("authorId"),
-                          "originCountry": d.get("originCountry"),
-                          "isPublished": d.get("isPublished", True),
-                          "hiddenByOriginCheck": d.get("hiddenByOriginCheck", False),
-                      }
-                  log(f"Database ready: {len(existing_anime)} anime series found.")
-              except Exception as e:
-                  log(f"[Warn] Error checking anime in Firestore: {e}")
-
-              return existing_anime
-
-          from bs4 import NavigableString
-
-          FALLBACK_SITE_URL = os.environ.get("FALLBACK_SITE_URL", "https://animedubhindi.link").rstrip("/")
-          FB_HUB_KEYS = ("hubcloud", "razorshell", "pixeldrain", "gamerxyt")
-          FB_DEAD_MARKERS = (
-              "file not found", "file has been removed", "file removed", "has been deleted",
-              "link expired", "invalid link", "no longer available", "file does not exist",
-          )
-
-          def is_link_alive(session, url: str, referer: str = ""):
-              # Sirf pakka dead (404/410 ya "file deleted" page) hone par False; shaque me True.
-              try:
-                  r = session.get(url, timeout=12, stream=True, allow_redirects=True,
-                                  headers={"Referer": referer or f"{DEFAULT_SITE_URL}/"})
-              except Exception:
-                  return False
-              try:
-                  if r.status_code in (404, 410):
-                      return False
-                  if "text/html" in r.headers.get("Content-Type", "").lower():
-                      body = next(r.iter_content(60000), b"").decode("utf-8", "ignore").lower()
-                      if any(m in body for m in FB_DEAD_MARKERS):
-                          return False
-                  return True
-              finally:
-                  r.close()
 
           def _norm_title(t: str) -> str:
               return re.sub(r"[^a-z0-9]+", " ", (t or "").lower()).strip()
@@ -638,11 +396,10 @@ jobs:
 
           def fallback_find_episode_page(post_html: str):
               soup = BeautifulSoup(post_html, "lxml")
-              anchors = soup.find_all("a", href=True)
-              for a in anchors:
+              for a in soup.find_all("a", href=True):
                   if "adhlinks" in a["href"].lower():
                       return a["href"].strip()
-              for a in anchors:
+              for a in soup.find_all("a", href=True):
                   label = a.get_text(" ", strip=True).lower()
                   if "download" in label and "watch" in label:
                       return a["href"].strip()
@@ -654,7 +411,6 @@ jobs:
               return base + (10 if ("x265" in l or "hevc" in l or "10bit" in l) else 0)
 
           def parse_adhlinks_episodes(page_html: str):
-              # return: {ep_number: [(rank, kind_priority, href), ...]}
               soup = BeautifulSoup(page_html, "lxml")
               root = soup.body or soup
               ep_re = re.compile(r"Episode\s*:?\s*0*(\d{1,4})", re.I)
@@ -673,160 +429,20 @@ jobs:
                           cur_ep, cur_label = int(m.group(1)), ""
                       elif q_re.search(t):
                           cur_label = t
-                      elif "watch online" in t.lower():
-                          cur_label = "watch"
                   elif getattr(node, "name", None) == "a" and node.get("href") and cur_ep is not None:
                       label = node.get_text(" ", strip=True).lower()
                       href = node["href"].strip()
-                      if cur_label == "watch":
-                          continue  # "Click Here" streaming page abhi skip
                       if "hcloud" in label or "hubcloud" in label:
                           kind = 0
                       elif "multi" in label:
                           kind = 1
                       else:
-                          continue  # GDF / MEGA / Fprs skip
+                          continue
                       eps.setdefault(cur_ep, []).append((_fb_quality_rank(cur_label), kind, href))
               return eps
 
-          import base64
-          from urllib.parse import urlparse, unquote
-
-          DIRECT_HOSTS = tuple(h.strip().lower() for h in os.environ.get("DIRECT_HOSTS", "hubcloud,pixeldrain").split(",") if h.strip())
-
-          def is_direct_host(url: str) -> bool:
-              try:
-                  host = urlparse((url or "").strip()).netloc.lower()
-              except Exception:
-                  return False
-              return bool(host) and any(h in host for h in DIRECT_HOSTS)
-
-          BLOCKED_LINK_HOSTS = tuple(h.strip().lower() for h in os.environ.get("BLOCKED_LINK_HOSTS", "razorshell").split(",") if h.strip())
-
-          def is_blocked_host(url: str) -> bool:
-              try:
-                  host = urlparse((url or "").strip()).netloc.lower()
-              except Exception:
-                  return False
-              return bool(host) and any(h in host for h in BLOCKED_LINK_HOSTS)
-
-          def link_status(session, url: str, referer: str = "") -> str:
-              # "ok" = direct (hubcloud/pixeldrain) aur chal raha hai | "blocked" = razorshell jaisa host (kabhi add nahi)
-              # | "not_direct" = wrapper/unsupported | "dead"
-              if is_blocked_host(url):
-                  return "blocked"
-              if not is_direct_host(url):
-                  return "not_direct"
-              return "ok" if is_link_alive(session, url, referer) else "dead"
-
-          def _b64_candidates(text: str):
-              toks = re.findall(r"atob\(\s*['\"]([A-Za-z0-9+/=_\-]{12,})['\"]\s*\)", text)
-              toks += [unquote(t) for t in re.findall(
-                  r"[?&](?:url|link|u|id|r|redirect|goto|data|d)=([A-Za-z0-9+/=_\-%]{16,})", text)]
-              out = []
-              for tok in toks:
-                  try:
-                      tok = tok.replace("-", "+").replace("_", "/")
-                      dec = base64.b64decode(tok + "=" * (-len(tok) % 4)).decode("utf-8", "ignore").strip()
-                      if dec.startswith("http"):
-                          out.append(dec)
-                  except Exception:
-                      pass
-              return out
-
-          def _find_direct_urls(text: str):
-              blob = html.unescape(text or "").replace("\\/", "/")
-              found = [u.rstrip(".,;") for u in re.findall(r"https?://[^\s\"'<>\\)]+", blob) if is_direct_host(u)]
-              found += [d for d in _b64_candidates(blob) if is_direct_host(d)]
-              return found
-
-          _HOP_SKIP = ("google", "gstatic", "cloudflare", "jsdelivr", "jquery", "bootstrap", "w3.org", "schema.org", "facebook", "twitter", "fonts.")
-
-          def _next_hops(text: str, base_url: str):
-              blob = html.unescape(text or "").replace("\\/", "/")
-              hops = re.findall(r"http-equiv=[\"']refresh[\"'][^>]*content=[\"'][^\"']*url=([^\"'>\s]+)", blob, re.I)
-              hops += re.findall(r"(?:location(?:\.href)?\s*=|location\.replace\(|window\.open\()\s*['\"]([^'\"]+)['\"]", blob)
-              if len(text or "") < 6000:
-                  # chhota redirector page: JS me variable se redirect ho sakta hai -> page ke andar ke URLs bhi hop maano
-                  for u in re.findall(r"https?://[^\s'\"<>\\)]+", blob):
-                      low = u.lower()
-                      if any(b in low for b in _HOP_SKIP) or re.search(r"\.(?:js|css|png|jpe?g|gif|svg|ico|woff2?)(?:\?|$)", low):
-                          continue
-                      hops.append(u.rstrip(".,;"))
-              try:
-                  soup = BeautifulSoup(text or "", "lxml")
-                  for a in soup.find_all("a", href=True):
-                      label = a.get_text(" ", strip=True).lower()
-                      if any(k in label for k in ("continue", "get link", "go to", "download", "hubcloud", "hcloud", "proceed", "unlock", "click here")):
-                          hops.append(a["href"].strip())
-              except Exception:
-                  pass
-              out, seen = [], set()
-              for h in hops:
-                  full = urljoin(base_url, h)
-                  if full.startswith("http") and full not in seen and full != base_url:
-                      seen.add(full)
-                      out.append(full)
-              return out
-
-          _DEBUG_SEEN = {"dumped": False, "hosts": set()}
-
-          def _debug_dead_end(r, depth, url):
-              if depth == 0:
-                  log(f"    [Link][Debug] No hubcloud/pixeldrain link via {urlparse(url).netloc} (final {r.url[:110]}, {len(r.text)} bytes)")
-                  if not _DEBUG_SEEN["dumped"] and len(r.text) < 6000:
-                      _DEBUG_SEEN["dumped"] = True
-                      log("    [Link][Debug] PAGE-URL " + r.url)
-                      log("    [Link][Debug] PAGE-SOURCE-START " + re.sub(r"\s+", " ", r.text)[:3000] + " PAGE-SOURCE-END")
-              else:
-                  host = urlparse(r.url).netloc
-                  if host not in _DEBUG_SEEN["hosts"]:
-                      _DEBUG_SEEN["hosts"].add(host)
-                      hosts = sorted({urlparse(u).netloc for u in re.findall(r"https?://[^\s\"'<>\\)]+", html.unescape(r.text or ""))})[:20]
-                      log(f"    [Link][Debug] Reached {r.url[:110]} ({len(r.text)} bytes). Hosts on page: {', '.join(hosts)}")
-
-          def extract_direct_link(session, url: str, referer: str = "", depth: int = 0, seen=None):
-              # Wrapper/redirect page se hubcloud/pixeldrain ka direct link nikalta hai (max 3 hop)
-              seen = seen if seen is not None else set()
-              if not url or url in seen or depth > 3 or len(seen) > 8 or is_blocked_host(url):
-                  return None
-              seen.add(url)
-              if is_direct_host(url):
-                  return url
-              try:
-                  r = session.get(url, timeout=12, allow_redirects=True, headers={"Referer": referer or url})
-              except Exception:
-                  return None
-              for h in [r.url] + [x.url for x in getattr(r, "history", [])]:
-                  if is_direct_host(h):
-                      return h
-              found = _find_direct_urls(r.text)
-              if found:
-                  return found[0]
-              for nxt in _next_hops(r.text, r.url)[:3]:
-                  got = extract_direct_link(session, nxt, r.url, depth + 1, seen)
-                  if got:
-                      return got
-              _debug_dead_end(r, depth, url)
-              return None
-
-          def resolve_fallback_link(session, href: str, referer: str):
-              if is_blocked_host(href):
-                  return None
-              if is_direct_host(href):
-                  return href
-              got = resolve_codedew_to_hubcloud(session, href, referer)
-              if got and is_direct_host(got):
-                  return got
-              return extract_direct_link(session, href, referer)
-
-          FB_STATE = {"disabled": False, "fail_titles": 0, "ok_titles": 0}
-
           def fetch_from_animedubhindi(session, clean_title: str, season_number: int, wanted=None, skip=None):
               skip = skip or set()
-              if FB_STATE["disabled"]:
-                  log("  [Fallback] Is run me band (pehle ke titles me link nahi nikla) - skip.")
-                  return {}
               result = {}
               post_url = fallback_find_post(session, clean_title, season_number)
               if not post_url:
@@ -837,198 +453,228 @@ jobs:
                   r1 = session.get(post_url, timeout=12, headers={"Referer": FALLBACK_SITE_URL + "/"})
                   hub_url = fallback_find_episode_page(r1.text) if r1.ok else None
                   if not hub_url:
-                      log("  [Fallback] Download/Watch button link not found on post.")
                       return result
                   r2 = session.get(urljoin(post_url, hub_url), timeout=15, headers={"Referer": post_url})
                   if not r2.ok:
-                      log(f"  [Fallback] Episode page HTTP {r2.status_code}")
                       return result
                   eps = parse_adhlinks_episodes(r2.text)
-                  log(f"  [Fallback] Episode page parsed: {len(eps)} episodes (html {len(r2.text)} bytes)")
+                  log(f"  [Fallback] Episode page parsed: {len(eps)} episodes available.")
               except Exception as e:
                   log(f"  [Fallback][Warn] {e}")
                   return result
 
-              consec_fail = 0
               for ep in sorted(eps):
                   if ep in skip or (wanted is not None and ep not in wanted):
                       continue
-                  if consec_fail >= 3 and not result:
-                      log("  [Fallback] Lagatar 3 episodes me link nahi mila - is title ka baaki skip.")
-                      break
                   cands = [h for _, _, h in sorted(eps[ep], key=lambda x: (x[0], x[1]))][:4]
                   for href in cands:
-                      url = resolve_fallback_link(session, urljoin(r2.url, href), r2.url)
-                      if url and link_status(session, url, r2.url) == "ok":
-                          result[ep] = url
-                          consec_fail = 0
-                          log(f"    [Ep {ep:02d}] Fallback stream -> {url[:60]}...")
+                      if is_direct_host(href) and not is_blocked_host(href):
+                          result[ep] = href
+                          log(f"    [Ep {ep:02d}] Fallback direct stream -> {href[:60]}...")
                           break
-                  else:
-                      consec_fail += 1
-                      log(f"    [Ep {ep:02d}] Fallback: no working link.")
-              if result:
-                  FB_STATE["ok_titles"] += 1
-              elif consec_fail >= 3:
-                  FB_STATE["fail_titles"] += 1
-                  if FB_STATE["fail_titles"] >= 4 and FB_STATE["ok_titles"] == 0:
-                      FB_STATE["disabled"] = True
-                      log("  [Fallback] 4 titles me ek bhi link nahi nikla - baaki run ke liye fallback band.")
+                      got = resolve_codedew_to_hubcloud(session, urljoin(r2.url, href), r2.url)
+                      if got and is_direct_host(got) and not is_blocked_host(got):
+                          result[ep] = got
+                          log(f"    [Ep {ep:02d}] Fallback stream -> {got[:60]}...")
+                          break
               return result
 
-          import datetime
-          import difflib
+          def fix_all_razorshell_anime_in_firestore(titles_ref, session):
+              log("=" * 65)
+              log("[Razorshell Auto-Fixer] Scanning Anime in Firestore for Razorshell links...")
+              log("=" * 65)
 
-          START_TS = time.time()
-          SOFT_DEADLINE_SEC = 26 * 60
-          RECHECK_DEADLINE_SEC = 18 * 60
-          RECHECK_STATE = {"left": int(os.environ.get("LINK_RECHECK_BUDGET", 80))}
-
-          ANILIST_URL = "https://graphql.anilist.co"
-          ASIAN_ORIGINS = {"JP", "KR", "CN", "TW"}
-          # Jo title galti se block ho jaye use yahan lowercase me daalo, e.g. {"some anime title"}
-          ORIGIN_ALLOWLIST = set()
-          _ORIGIN_CACHE = {}
-
-          def _is_junk_url(u: str) -> bool:
-              return bool(re.search(
-                  r"/(?:feed|comments?)(?:/|$)|/comment-page-\d+|/page/\d+|/category/|/tag/|[?&]replytocom=",
-                  u or "", re.I))
-
-          def _origin_from_media(query_title, media_list):
-              want = _norm_title(query_title)
-              best, best_score = None, 0.0
-              for m in media_list or []:
-                  t = m.get("title") or {}
-                  names = [t.get("romaji"), t.get("english"), t.get("native")] + list(m.get("synonyms") or [])
-                  for n in names:
-                      nn = _norm_title(n or "")
-                      if not nn or not want:
-                          continue
-                      s = difflib.SequenceMatcher(None, want, nn).ratio()
-                      shorter, longer = min(len(want), len(nn)), max(len(want), len(nn))
-                      if shorter >= 6 and shorter / longer >= 0.6 and (want in nn or nn in want):
-                          s = max(s, 0.9)
-                      if s > best_score:
-                          best, best_score = m, s
-              if best is None or best_score < 0.85:
-                  return "unknown", None
-              cc = (best.get("countryOfOrigin") or "").upper()
-              return ("asian" if cc in ASIAN_ORIGINS else "non_asian"), (cc or None)
-
-          def anilist_origin(title: str):
-              # returns (verdict, country): verdict = asian | non_asian | unknown | error
-              if (title or "").strip().lower() in ORIGIN_ALLOWLIST:
-                  return "asian", "JP"
-              key = _norm_title(title)
-              if not key:
-                  return "unknown", None
-              if key in _ORIGIN_CACHE:
-                  return _ORIGIN_CACHE[key]
-              q = re.sub(r"\ball\s+seasons?\b.*", "", title or "", flags=re.I).strip() or title
-              query = ("query($s:String){Page(perPage:6){media(search:$s,type:ANIME)"
-                       "{countryOfOrigin title{romaji english native} synonyms}}}")
-              for _attempt in range(3):
-                  try:
-                      time.sleep(1.1)
-                      r = requests.post(
-                          ANILIST_URL,
-                          json={"query": query, "variables": {"s": q}},
-                          headers={"Content-Type": "application/json", "Accept": "application/json"},
-                          timeout=15,
-                      )
-                  except Exception as e:
-                      log(f"  [Origin][Warn] AniList request failed: {e}")
-                      continue
-                  if r.status_code == 429:
-                      try:
-                          wait = min(int(r.headers.get("Retry-After", "30")), 65)
-                      except Exception:
-                          wait = 30
-                      log(f"  [Origin] AniList rate limit, waiting {wait}s")
-                      time.sleep(wait)
-                      continue
-                  if not r.ok:
-                      log(f"  [Origin][Warn] AniList HTTP {r.status_code}")
-                      return "error", None
-                  try:
-                      media = ((r.json().get("data") or {}).get("Page") or {}).get("media") or []
-                  except Exception:
-                      return "error", None
-                  res = _origin_from_media(q, media)
-                  _ORIGIN_CACHE[key] = res
-                  return res
-              return "error", None
-
-          def link_recheck_due(ep_d: dict, days: int = 7, key: str = "linkCheckedAt") -> bool:
-              t = (ep_d or {}).get(key)
-              if not t:
-                  return True
+              fixed_count = 0
               try:
-                  age = datetime.datetime.now(datetime.timezone.utc) - t
-                  return age.total_seconds() >= days * 86400
+                  anime_docs = list(titles_ref.where("type", "==", "series").stream())
               except Exception:
-                  return True
+                  anime_docs = [d for d in titles_ref.stream() if (d.to_dict() or {}).get("type") == "series"]
 
-          def cleanup_non_anime(titles_ref, existing_anime):
-              mode = os.environ.get("ORIGIN_CLEANUP", "unpublish").strip().lower()
-              if mode not in ("unpublish", "delete"):
-                  log("[Origin-Cleanup] OFF (ORIGIN_CLEANUP not set to unpublish/delete)")
-                  return
-              budget = int(os.environ.get("ORIGIN_CHECK_BUDGET", 120))
-              hidden = restored = checked = 0
-              log(f"[Origin-Cleanup] Checking automation-added titles (mode={mode}, budget={budget})...")
-              for doc_id, info in list(existing_anime.items()):
-                  if info.get("authorId") != "github_automation":
-                      continue  # manual / baaki titles ko kabhi nahi chhedna
-                  title = info.get("title", "")
-                  cc = info.get("originCountry")
-                  if title.strip().lower() in ORIGIN_ALLOWLIST:
-                      cc = "JP"
-                  if not cc:
-                      if budget <= 0:
-                          continue
-                      budget -= 1
-                      checked += 1
-                      verdict, found_cc = anilist_origin(title)
-                      if verdict == "error":
-                          continue
-                      cc = found_cc if found_cc else "UNKNOWN"
+              for doc in anime_docs:
+                  d = doc.to_dict() or {}
+                  title = str(d.get("title", "")).strip()
+                  doc_id = doc.id
+                  v_url = str(d.get("videoUrl", "")).lower()
+
+                  genres = d.get("genres", [])
+                  if not ("Anime" in genres or "Animation" in genres or doc_id.startswith("anime_")):
+                      continue
+
+                  has_razorshell = "razorshell" in v_url
+                  if not has_razorshell:
                       try:
-                          titles_ref.document(doc_id).update({"originCountry": cc})
+                          for ep_doc in doc.reference.collection("episodes").limit(3).stream():
+                              ep_d = ep_doc.to_dict() or {}
+                              ep_u = (str(ep_d.get("videoUrl", "")) + str(ep_d.get("streamUrl", ""))).lower()
+                              if "razorshell" in ep_u:
+                                  has_razorshell = True
+                                  break
                       except Exception:
                           pass
-                      info["originCountry"] = cc
-                  if cc in ASIAN_ORIGINS:
-                      if info.get("hiddenByOriginCheck") and info.get("isPublished") is False:
-                          try:
-                              titles_ref.document(doc_id).update({"isPublished": True, "hiddenByOriginCheck": False})
-                              info["isPublished"] = True
-                              restored += 1
-                              log(f"  [Origin-Cleanup] Restored '{title}' ({cc})")
-                          except Exception:
-                              pass
+
+                  if not has_razorshell:
                       continue
-                  # non-Asian ya confirm nahi hua
-                  if mode == "delete":
-                      try:
-                          for ep_doc in titles_ref.document(doc_id).collection("episodes").stream():
-                              ep_doc.reference.delete()
-                          titles_ref.document(doc_id).delete()
-                          existing_anime.pop(doc_id, None)
-                          hidden += 1
-                          log(f"  [Origin-Cleanup] Deleted non-anime '{title}' ({cc})")
-                      except Exception as e:
-                          log(f"  [Warn] Delete failed for '{title}': {e}")
-                  elif info.get("isPublished", True) is not False:
-                      try:
-                          titles_ref.document(doc_id).update({"isPublished": False, "hiddenByOriginCheck": True})
-                          info["isPublished"] = False
-                          hidden += 1
-                          log(f"  [Origin-Cleanup] Hidden '{title}' (origin: {cc})")
-                      except Exception as e:
-                          log(f"  [Warn] Hide failed for '{title}': {e}")
-              log(f"[Origin-Cleanup] Done. checked={checked}, hidden/deleted={hidden}, restored={restored}")
+
+                  log(f"\n[Fixing Razorshell Anime] '{title}' ({doc_id}) -> Fetching direct HubCloud from {FALLBACK_SITE_URL}...")
+                  clean_t, s_num, _, _ = sanitize_anime_title(title)
+                  fb_eps = fetch_from_animedubhindi(session, clean_t, s_num)
+                  if not fb_eps:
+                      fb_eps = fetch_from_animedubhindi(session, title, s_num)
+
+                  if not fb_eps:
+                      log(f"  [Skip] Fallback site did not return episodes for '{title}'")
+                      continue
+
+                  episodes_col = doc.reference.collection("episodes")
+                  updated_eps = 0
+                  first_hub = None
+
+                  for ep_num, hub_link in fb_eps.items():
+                      if not is_direct_host(hub_link) or is_blocked_host(hub_link):
+                          continue
+                      if not first_hub:
+                          first_hub = hub_link
+                      ep_doc_id = f"s{s_num}_ep{ep_num}"
+                      episodes_col.document(ep_doc_id).set({
+                          "videoUrl": hub_link,
+                          "streamUrl": hub_link,
+                          "linkStatus": "ok",
+                          "linkCheckedAt": firestore.SERVER_TIMESTAMP,
+                          "updatedAt": firestore.SERVER_TIMESTAMP,
+                      }, merge=True)
+                      updated_eps += 1
+
+                  if first_hub:
+                      doc.reference.update({
+                          "videoUrl": first_hub,
+                          "trailerUrl": first_hub,
+                          "updatedAt": firestore.SERVER_TIMESTAMP,
+                      })
+
+                  fixed_count += 1
+                  log(f"  [SUCCESS] Fixed {updated_eps} episodes for '{title}' -> All replaced with direct HubCloud!")
+
+              log("=" * 65)
+              log(f"[Razorshell Auto-Fixer] Finished! Total Anime Series Fixed: {fixed_count}")
+              log("=" * 65)
+
+          def process_single_anime_target(titles_ref, session, base_url: str, target_name: str):
+              log("=" * 65)
+              log(f"[Targeted Anime Mode] Searching & Adding ONLY: '{target_name}'")
+              log("=" * 65)
+
+              if is_title_blocked(target_name):
+                  log(f"ERROR: '{target_name}' is blocked by Anime Exclusion Filter.")
+                  return
+
+              clean_t, season_number, language, year = sanitize_anime_title(target_name)
+              slug = re.sub(r"[^a-z0-9]+", "_", clean_t.lower()).strip("_")
+              doc_id = f"anime_{slug}"[:60]
+
+              query = quote_plus(target_name)
+              search_url = f"{base_url}/?s={query}"
+              matched_url = None
+              try:
+                  r = session.get(search_url, timeout=12)
+                  if r.ok:
+                      for art in re.findall(r'<article[\s\S]*?</article>', r.text, re.I):
+                          m = re.search(r'href=["\'](https?://(?:www\.)?rareanimes\.mov/[^\s"\'#?]+)["\']', art, re.I)
+                          if m and not is_title_blocked(m.group(1)):
+                              matched_url = m.group(1).split("?")[0].rstrip("/") + "/"
+                              break
+              except Exception:
+                  pass
+
+              if not matched_url and target_name.startswith("http"):
+                  matched_url = target_name
+
+              episodes_map = {}
+              details = None
+              raw_ep_titles = {}
+
+              if matched_url:
+                  log(f"Found post on {base_url}: {matched_url}")
+                  details = fetch_anime_post_details(session, matched_url)
+                  if details:
+                      clean_t, season_number, language, year = sanitize_anime_title(details["raw_title"])
+                      slug = re.sub(r"[^a-z0-9]+", "_", clean_t.lower()).strip("_")
+                      doc_id = f"anime_{slug}"[:60]
+                      raw_ep_map, raw_ep_titles = extract_raw_hubcloud_episode_map(details["html"])
+                      for ep_num in sorted(raw_ep_map.keys()):
+                          for cand in raw_ep_map[ep_num][:6]:
+                              if is_blocked_host(cand):
+                                  continue
+                              got = resolve_codedew_to_hubcloud(session, cand, matched_url)
+                              if got and is_direct_host(got) and not is_blocked_host(got):
+                                  episodes_map[ep_num] = got
+                                  break
+
+              valid_eps = {k: u for k, u in episodes_map.items() if is_direct_host(u) and not is_blocked_host(u)}
+              if not valid_eps:
+                  log(f"Primary site has no direct stream for '{clean_t}', searching Fallback site ({FALLBACK_SITE_URL})...")
+                  fb_eps = fetch_from_animedubhindi(session, clean_t, season_number)
+                  if not fb_eps:
+                      fb_eps = fetch_from_animedubhindi(session, target_name, season_number)
+                  valid_eps = {k: u for k, u in fb_eps.items() if is_direct_host(u) and not is_blocked_host(u)}
+
+              if not valid_eps:
+                  log(f"ERROR: Could not find working direct stream links for '{target_name}' on any site.")
+                  return
+
+              sorted_eps = sorted(valid_eps.keys())
+              first_stream = valid_eps[sorted_eps[0]]
+              poster = (details["poster"] if details and details.get("poster") else "") or "drawable://img_hero_nebula"
+              synopsis = (details["synopsis"] if details and details.get("synopsis") else "") or f"Watch and download {clean_t} in {language}."
+
+              titles_ref.document(doc_id).set({
+                  "authorId": "admin_targeted_action",
+                  "type": "series",
+                  "title": clean_t[:200],
+                  "description": synopsis[:2000],
+                  "poster": poster[:500],
+                  "backdrop": poster[:500],
+                  "genres": ["Anime", "Animation", "Action", "Fantasy", "Adventure"],
+                  "cast": ["Original Voice Cast"],
+                  "director": "Anime Studio Release",
+                  "language": language[:50],
+                  "year": year,
+                  "rating": 8.8,
+                  "ageRating": "U/A 13+",
+                  "duration": f"Season {season_number}",
+                  "trailerUrl": first_stream[:500],
+                  "videoUrl": first_stream[:500],
+                  "subtitles": ["English", "Hindi"],
+                  "audioTracks": ["Hindi", "Japanese"],
+                  "isFeatured": True,
+                  "isTrending": True,
+                  "isNewRelease": True,
+                  "isUpcoming": False,
+                  "isPublished": True,
+                  "seasonCount": max(1, season_number),
+                  "updatedAt": firestore.SERVER_TIMESTAMP,
+              }, merge=True)
+
+              episodes_col = titles_ref.document(doc_id).collection("episodes")
+              for ep_num, stream_url in valid_eps.items():
+                  ep_doc_id = f"s{season_number}_ep{ep_num}"
+                  ep_title = raw_ep_titles.get(ep_num) or f"Episode {ep_num}"
+                  episodes_col.document(ep_doc_id).set({
+                      "titleId": doc_id,
+                      "seasonNumber": season_number,
+                      "episodeNumber": ep_num,
+                      "title": ep_title[:200],
+                      "description": f"{clean_t} - Season {season_number}, Episode {ep_num}: {ep_title}"[:500],
+                      "thumbnail": poster[:500],
+                      "duration": "24m",
+                      "videoUrl": stream_url[:500],
+                      "streamUrl": stream_url[:500],
+                      "linkStatus": "ok",
+                      "linkCheckedAt": firestore.SERVER_TIMESTAMP,
+                      "isPublished": True,
+                      "updatedAt": firestore.SERVER_TIMESTAMP,
+                  }, merge=True)
+
+              log(f"SUCCESS! Published Targeted Anime '{clean_t}' Season {season_number} with {len(valid_eps)} direct HubCloud episodes!")
 
           def main():
               log("=" * 65)
@@ -1039,283 +685,13 @@ jobs:
               session = create_http_session()
               titles_ref = db.collection("titles")
 
-              existing_anime = load_fast_existing_anime(titles_ref)
-              cleanup_non_anime(titles_ref, existing_anime)
-              target_urls, seen_urls = collect_target_anime_urls(session, DEFAULT_SITE_URL)
-              log(f"Target anime series to process: {len(target_urls)}")
+              if TARGET_TITLE:
+                  process_single_anime_target(titles_ref, session, DEFAULT_SITE_URL, TARGET_TITLE)
+                  return
 
-              published_count = 0
-              searched_series_titles = set()
-              idx = 0
+              fix_all_razorshell_anime_in_firestore(titles_ref, session)
 
-              while idx < len(target_urls):
-                  post_url = target_urls[idx]
-                  idx += 1
-                  if time.time() - START_TS > SOFT_DEADLINE_SEC:
-                      log("[Time] Soft deadline reached - stopping this run cleanly (baaki agle run me).")
-                      break
-                  if _is_junk_url(post_url):
-                      log(f"\n[{idx}/{len(target_urls)}] [Junk URL] Skipping {post_url}")
-                      continue
-                  if is_title_blocked(post_url):
-                      log(f"\n[{idx}/{len(target_urls)}] [Blocked URL] Skipping {post_url}")
-                      continue
-
-                  log(f"\n[{idx}/{len(target_urls)}] Processing: {post_url}")
-                  details = fetch_anime_post_details(session, post_url)
-                  if not details or not details["raw_title"]:
-                      continue
-
-                  clean_title, season_number, language, year = sanitize_anime_title(details["raw_title"])
-                  if is_title_blocked(clean_title) or is_title_blocked(details["raw_title"]):
-                      log(f"  [Filter Blocked] Skipping '{clean_title}' (Non-anime / Blocked title)")
-                      continue
-                  slug = re.sub(r"[^a-z0-9]+", "_", clean_title.lower()).strip("_")
-                  doc_id = f"anime_{slug}"[:60]
-
-                  stored_origin = existing_anime.get(doc_id, {}).get("originCountry")
-                  if stored_origin in ASIAN_ORIGINS:
-                      origin_cc = stored_origin
-                  elif stored_origin and clean_title.strip().lower() not in ORIGIN_ALLOWLIST:
-                      log(f"  [Origin] '{clean_title}' was judged non-anime earlier ({stored_origin}) - skipping.")
-                      continue
-                  else:
-                      verdict, origin_cc = anilist_origin(clean_title)
-                      if verdict != "asian":
-                          log(f"  [Origin] '{clean_title}' not confirmed as Japanese/Korean/Chinese anime ({verdict}, {origin_cc}) - skipping.")
-                          continue
-
-                  raw_ep_map, raw_ep_titles = extract_raw_hubcloud_episode_map(details["html"])
-                  if not raw_ep_map:
-                      log(f"  [Info] No stream links on primary page for '{clean_title}' - trying fallback site.")
-
-                  if clean_title.lower() not in searched_series_titles:
-                      searched_series_titles.add(clean_title.lower())
-                      related_urls = discover_all_seasons_for_series(session, DEFAULT_SITE_URL, clean_title, details["html"], seen_urls)
-                      if related_urls:
-                          log(f"  [Multi-Season Discovery] Found {len(related_urls)} companion season posts for '{clean_title}'!")
-                          target_urls.extend(related_urls)
-
-                  existing_season_eps = {}
-                  existing_ep_refs = {}
-                  dead_eps = set()
-                  frozen_dead = set()
-                  upgrade_eps = set()
-                  wrapper_urls = {}
-                  try:
-                      for ep_doc in titles_ref.document(doc_id).collection("episodes").where("seasonNumber", "==", season_number).stream():
-                          ep_d = ep_doc.to_dict() or {}
-                          e_num = int(ep_d.get("episodeNumber", 1) or 1)
-                          s_url = str(ep_d.get("streamUrl") or ep_d.get("videoUrl") or "").strip()
-                          existing_ep_refs[e_num] = (ep_doc.reference, ep_d)
-                          if ep_d.get("linkStatus") == "dead":
-                              if link_recheck_due(ep_d, days=2):
-                                  dead_eps.add(e_num)
-                              else:
-                                  frozen_dead.add(e_num)
-                              continue
-                          if s_url:
-                              if is_blocked_host(s_url):
-                                  log(f"    [Ep {e_num:02d}] Saved link is blocked host ({urlparse(s_url).netloc}) -> dusri site se replace hoga.")
-                                  dead_eps.add(e_num)
-                                  continue
-                              if (not is_direct_host(s_url)) and link_recheck_due(ep_d, days=2, key="upgradeTriedAt"):
-                                  upgrade_eps.add(e_num)   # direct (hubcloud/pixeldrain) nahi hai -> badalne ki koshish
-                              else:
-                                  existing_season_eps[e_num] = s_url
-                  except Exception:
-                      pass
-
-                  # Purane saved links ka dead-check (har run me limited budget, 7 din me ek baar)
-                  for e_num in sorted(existing_season_eps.keys()):
-                      ref, ep_d = existing_ep_refs[e_num]
-                      if not link_recheck_due(ep_d):
-                          continue
-                      if RECHECK_STATE["left"] <= 0 or time.time() - START_TS > RECHECK_DEADLINE_SEC:
-                          break
-                      RECHECK_STATE["left"] -= 1
-                      if is_link_alive(session, existing_season_eps[e_num], post_url):
-                          try:
-                              ref.update({"linkStatus": "ok", "linkCheckedAt": firestore.SERVER_TIMESTAMP})
-                          except Exception:
-                              pass
-                      else:
-                          log(f"    [Ep {e_num:02d}] Saved link is DEAD -> re-resolving.")
-                          dead_eps.add(e_num)
-                  for e_num in dead_eps:
-                      existing_season_eps.pop(e_num, None)
-                  for e_num in frozen_dead:
-                      raw_ep_map.pop(e_num, None)
-                  if frozen_dead and not raw_ep_map and not dead_eps and not existing_season_eps:
-                      log(f"  [Dead] '{clean_title}' S{season_number}: sab links dead, thodi der baad dobara try hoga.")
-                      continue
-
-                  known_eps = set(existing_season_eps.keys()) | frozen_dead
-                  gap_eps = (set(range(1, max(known_eps) + 1)) - known_eps) if known_eps else set()
-                  if gap_eps:
-                      log(f"  [Gap] '{clean_title}' S{season_number} missing episodes in DB: {sorted(gap_eps)}")
-                  if raw_ep_map and existing_season_eps and not gap_eps and all(ep in existing_season_eps for ep in raw_ep_map.keys()):
-                      log(
-                          f"  [Already Added] Anime '{clean_title}' Season {season_number} has all {len(raw_ep_map)} episodes in CineNova. Skipping!"
-                      )
-                      continue
-
-                  episodes_map = (
-                      resolve_anime_episodes(session, raw_ep_map, existing_season_eps, post_url)
-                      if raw_ep_map else {}
-                  )
-
-                  # Primary site ke naye resolve hue links verify karo
-                  for _ep in list(episodes_map.keys()):
-                      if _ep in existing_season_eps:
-                          continue
-                      _st = link_status(session, episodes_map[_ep], post_url)
-                      if _st == "not_direct":
-                          _deep = extract_direct_link(session, episodes_map[_ep], post_url)
-                          if _deep and link_status(session, _deep, post_url) == "ok":
-                              log(f"    [Ep {_ep:02d}] Wrapper link -> direct link extracted.")
-                              episodes_map[_ep] = _deep
-                              continue
-                      if _st != "ok":
-                          log(f"    [Ep {_ep:02d}] Primary link {_st} -> fallback site try hoga.")
-                          if _st == "not_direct":
-                              wrapper_urls[_ep] = episodes_map[_ep]
-                          episodes_map.pop(_ep)
-
-                  expected_eps = set(raw_ep_map.keys())
-                  missing_eps = (expected_eps - set(episodes_map.keys())) if expected_eps else None
-                  if missing_eps is not None:
-                      missing_eps |= (gap_eps - set(episodes_map.keys()))
-
-                  if missing_eps is None or missing_eps:
-                      fb_eps = fetch_from_animedubhindi(
-                          session, clean_title, season_number,
-                          wanted=missing_eps,
-                          skip=set(existing_season_eps.keys()) | set(episodes_map.keys()),
-                      )
-                      for _ep, _url in fb_eps.items():
-                          episodes_map[_ep] = _url
-                      if fb_eps:
-                          log(f"  [Fallback] Added {len(fb_eps)} episodes from AnimeDubHindi.")
-
-                  if os.environ.get("KEEP_WRAPPER_LINKS", "false").strip().lower() == "true":
-                      for _ep, _u in wrapper_urls.items():
-                          episodes_map.setdefault(_ep, _u)
-                  for _ep in sorted(upgrade_eps - set(episodes_map.keys())):
-                      _ref = existing_ep_refs.get(_ep)
-                      if _ref:
-                          try:
-                              _ref[0].update({"upgradeTriedAt": firestore.SERVER_TIMESTAMP})
-                              log(f"    [Ep {_ep:02d}] Direct link kahin nahi mila - purana link rakha (2 din baad dobara try).")
-                          except Exception:
-                              pass
-                  for _ep in sorted(dead_eps - set(episodes_map.keys())):
-                      _ref = existing_ep_refs.get(_ep)
-                      if _ref:
-                          try:
-                              _ref[0].update({"isPublished": False, "linkStatus": "dead", "linkCheckedAt": firestore.SERVER_TIMESTAMP})
-                              log(f"    [Ep {_ep:02d}] No working link anywhere -> episode hidden (isPublished=False).")
-                          except Exception as _e:
-                              log(f"  [Warn] Could not mark dead episode: {_e}")
-
-                  if not episodes_map:
-                      log(f"  [Skip] Could not resolve any episodes for '{clean_title}'.")
-                      continue
-
-                  poster = details["poster"] or "drawable://img_hero_nebula"
-                  sorted_eps = sorted(episodes_map.keys())
-                  first_stream = episodes_map[sorted_eps[0]]
-                  current_seasons = existing_anime.get(doc_id, {}).get("seasonCount", 1)
-
-                  genres = ["Anime", "Animation", "Action", "Fantasy", "Adventure"]
-                  first_time_fields = {}
-                  if doc_id not in existing_anime:   # sirf bilkul naye title par set hota hai
-                      first_time_fields = {
-                          "rating": 8.8,
-                          "isFeatured": (published_count < 4),
-                          "isTrending": (published_count < 12),
-                          "isNewRelease": True,
-                          "viewsCount": 0,
-                          "createdAt": firestore.SERVER_TIMESTAMP,
-                      }
-                  titles_ref.document(doc_id).set(
-                      {
-                          "authorId": "github_automation",
-                          "originCountry": origin_cc,
-                          "type": "series",
-                          "title": clean_title[:200],
-                          "description": (
-                              details["synopsis"]
-                              or f"Watch and download {clean_title} Season {season_number} in {language} with full offline support."
-                          )[:2000],
-                          "poster": poster[:500],
-                          "backdrop": poster[:500],
-                          "genres": genres,
-                          "cast": ["Original Japanese & Hindi Voice Cast"],
-                          "director": "Anime Studio Release",
-                          "language": language[:50],
-                          "year": year,
-                          "ageRating": "U/A 13+",
-                          "duration": f"Season {season_number}",
-                          "trailerUrl": first_stream[:500],
-                          "videoUrl": first_stream[:500],
-                          "subtitles": ["English", "Hindi"],
-                          "audioTracks": ["Hindi", "Japanese"],
-                          "isUpcoming": False,
-                          "isPublished": True,
-                          "seasonCount": max(current_seasons, season_number),
-                          "updatedAt": firestore.SERVER_TIMESTAMP,
-                          **first_time_fields,
-                      },
-                      merge=True,
-                  )
-
-                  episodes_col = titles_ref.document(doc_id).collection("episodes")
-                  valid_ep_ids = set()
-
-                  for ep_num, stream_url in episodes_map.items():
-                      ep_doc_id = f"s{season_number}_ep{ep_num}"
-                      valid_ep_ids.add(ep_doc_id)
-                      ep_title = raw_ep_titles.get(ep_num) or f"Episode {ep_num}"
-                      episodes_col.document(ep_doc_id).set(
-                          {
-                              "titleId": doc_id,
-                              "seasonNumber": season_number,
-                              "episodeNumber": ep_num,
-                              "title": ep_title[:200],
-                              "description": f"{clean_title} - Season {season_number}, Episode {ep_num}: {ep_title}"[:500],
-                              "thumbnail": poster[:500],
-                              "duration": "24m",
-                              "videoUrl": stream_url[:500],
-                              "streamUrl": stream_url[:500],
-                              **({"linkStatus": "ok", "linkCheckedAt": firestore.SERVER_TIMESTAMP} if ep_num not in existing_season_eps else {}),
-                              "isPublished": True,
-                              **({"createdAt": firestore.SERVER_TIMESTAMP} if ep_num not in existing_ep_refs else {}),
-                              "updatedAt": firestore.SERVER_TIMESTAMP,
-                          },
-                          merge=True,
-                      )
-
-                  published_count += 1
-                  existing_anime.setdefault(
-                      doc_id,
-                      {
-                          "id": doc_id,
-                          "title": clean_title,
-                          "seasonCount": max(current_seasons, season_number),
-                          "videoUrl": first_stream,
-                          "originCountry": origin_cc,
-                      },
-                  )
-
-                  log(
-                      f"  => SUCCESS: Published '{clean_title}' Season {season_number} with {len(valid_ep_ids)} real episodes!"
-                  )
-
-              log("\n" + "=" * 65)
-              log(f"Anime Automation Finished! Total Series Published/Updated: {published_count}")
-              log("=" * 65)
+              log("\nReady! Scheduled scan will continue with ongoing anime updates.")
 
           if __name__ == "__main__":
               main()
-          EOF
