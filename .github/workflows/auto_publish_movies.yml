@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       target_title:
-        description: 'Target Movie/Series name (e.g. "Peddi", "Pushpa 2", "Mirzapur" - Leave empty for regular catalog sync)'
+        description: 'Target Movie/Series name (e.g. "VisionQuest", "Peddi", "Pushpa 2" - Leave empty for regular catalog sync)'
         required: false
         default: ''
       weekly_cleanup:
@@ -58,10 +58,9 @@ jobs:
             * Weekly Deep Cleanup: Full database scan & duplicate removal runs once a week (Sundays).
             * Targeted Single Title Mode: Run with TARGET_TITLE to search and add ONLY that specific
               movie or series in seconds (< 5 reads/writes, 0.01% quota used).
-          - Configured for: https://new2.movies4u.garden (or MOVIES_SITE_URL)
-          - Smart Genre & Rating Extraction from JSON-LD schema / article text / breadcrumbs.
-          - Category Classifier: Trending, Featured, New Releases, Top Rated.
-          - Clean Title Sanitizer & Strict Multi-Season/Episode Extraction.
+            * Dynamic Series Episode Sync: Detects new episodes (e.g. Ep 5, Ep 6) and automatically
+              adds missing episodes while saving quota for already-synced movies.
+          - Configured for: https://new3.movies4u.garden
           """
 
           import datetime
@@ -77,7 +76,7 @@ jobs:
           from firebase_admin import credentials, firestore
           import requests
 
-          DEFAULT_SITE_URL = os.environ.get("MOVIES_SITE_URL", os.environ.get("SITE_URL", "https://new2.movies4u.garden")).rstrip("/")
+          DEFAULT_SITE_URL = os.environ.get("MOVIES_SITE_URL", os.environ.get("SITE_URL", "https://new3.movies4u.garden")).rstrip("/")
           MAX_MOVIES_PER_RUN = int(os.environ.get("MAX_MOVIES_PER_RUN", os.environ.get("MAX_MOVIES", 45)))
           FIREBASE_DATABASE_ID = os.environ.get(
               "FIREBASE_DATABASE_ID",
@@ -438,6 +437,14 @@ jobs:
                       merge=True,
                   )
 
+              try:
+                  titles_ref.document(doc_id).update({
+                      "episodesCount": len(valid_ep_doc_ids),
+                      "updatedAt": firestore.SERVER_TIMESTAMP,
+                  })
+              except Exception as e:
+                  pass
+
               removed_count = 0
               try:
                   for old_ep in episodes_col.stream():
@@ -451,7 +458,6 @@ jobs:
 
 
           def search_real_post(session, base_url: str, title: str, require_series: bool = False):
-              """Searches lookup.php with fallback to HTML search."""
               search_terms = [title]
               base_title = re.sub(r"[:\-–].*$", "", title).strip()
               if base_title and base_title != title:
@@ -489,7 +495,6 @@ jobs:
                   except Exception:
                       continue
 
-              # Fallback to WordPress ?s= search
               try:
                   s_url = f"{base_url}/?s={quote_plus(title)}"
                   r = session.get(s_url, timeout=15)
@@ -592,6 +597,7 @@ jobs:
                   "authorId": "admin_targeted_action",
                   "type": content_type,
                   "title": clean_title[:200],
+                  "rawTitle": found_title[:300],
                   "description": synopsis[:2000],
                   "poster": poster[:500],
                   "backdrop": poster[:500],
@@ -614,6 +620,7 @@ jobs:
                   "isPublished": True,
                   "viewsCount": 0,
                   "seasonCount": max(1, max_season),
+                  "episodesCount": len(episodes_map) if content_type == "series" else 0,
                   "updatedAt": firestore.SERVER_TIMESTAMP,
               }
 
@@ -735,7 +742,6 @@ jobs:
 
               published_movies = 0
               published_series = 0
-              updated_count = 0
               skipped_count = 0
 
               for idx, post in enumerate(posts):
@@ -753,8 +759,20 @@ jobs:
                   if doc_snap and doc_snap.exists:
                       d = doc_snap.to_dict() or {}
                       video_url = str(d.get("videoUrl", "")).strip()
-                      if video_url and len(video_url) > 10:
-                          print(f"  [Already Synced] '{clean_title}' ({year}) exists with stream link. Skipping.")
+                      stored_raw_title = str(d.get("rawTitle", "")).strip()
+                      stored_ep_count = int(d.get("episodesCount", 0) or 0)
+
+                      # For Movies: if videoUrl exists, movie is already complete! Skip.
+                      if content_type == "movie" and video_url and len(video_url) > 10:
+                          print(f"  [Already Synced Movie] '{clean_title}' ({year}) exists with stream link. Skipping.")
+                          skipped_count += 1
+                          continue
+
+                      # For Series: if the rawTitle is identical to what we previously processed AND episodes exist, skip!
+                      # BUT if the website updated the title (e.g. '[Ep06 Added]' vs '[Ep04 Added]') or rawTitle wasn't stored yet,
+                      # we re-extract episodes to sync newly added episodes!
+                      if content_type == "series" and stored_raw_title == post["raw_title"].strip() and stored_ep_count > 0:
+                          print(f"  [Already Synced Series] '{clean_title}' has all {stored_ep_count} episodes. Skipping.")
                           skipped_count += 1
                           continue
 
@@ -787,6 +805,7 @@ jobs:
                       "authorId": "github_automation",
                       "type": content_type,
                       "title": clean_title[:200],
+                      "rawTitle": post["raw_title"][:300],
                       "description": (post["synopsis"] or f"Watch and download {clean_title} ({year}) in {language}.")[:2000],
                       "poster": poster,
                       "backdrop": poster,
@@ -809,6 +828,7 @@ jobs:
                       "isPublished": True,
                       "viewsCount": 0,
                       "seasonCount": max(1, max_season),
+                      "episodesCount": len(episodes_map) if content_type == "series" else 0,
                       "updatedAt": firestore.SERVER_TIMESTAMP,
                   }
 
