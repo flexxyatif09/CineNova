@@ -53,6 +53,9 @@ jobs:
           """
           CineNova Automated Movie & Web Series Scraper + Firestore Publisher
           ====================================================================
+          - Strict Quality Control:
+            * STRICT 720p: Strictly extracts 720p links for both movies and series.
+            * STRICT HubCloud Priority: Always picks Hub-Cloud [DD] over GDFlix.
           - Optimized for Quota Safety:
             * Fast Quota-Saver Mode: Normal runs only check newly scraped items (< 50 reads).
             * Weekly Deep Cleanup: Full database scan & duplicate removal runs once a week (Sundays).
@@ -315,51 +318,80 @@ jobs:
 
 
           def extract_multi_hop_links(session, post_url: str, post_html: str):
-              m4u_and_direct = re.findall(
-                  r"href=[\x27\"](https?://[^\x27\"<>]*(?:m4ulinks|hubcloud|vcloud|gdflix)[^\x27\"<>]*)[\x27\"]",
-                  post_html,
-                  re.I,
-              )
-              step1_candidates = list(dict.fromkeys([u for u in m4u_and_direct if "/drive/admin" not in u.lower()]))
+              """
+              Extracts the primary 720p HubCloud link for a Movie.
+              STRICT 720p and STRICT HubCloud priority!
+              """
+              tagged_links = []
+              seen = set()
+              for m in re.finditer(r"href=[\x27\"](https?://[^\x27\"<>]*m4ulinks[^\x27\"<>]*)[\x27\"]", post_html, re.I):
+                  link = m.group(1).strip()
+                  if "/drive/admin" in link.lower() or link in seen:
+                      continue
+                  seen.add(link)
+                  start = max(0, m.start() - 150)
+                  pre = post_html[start:m.start()].lower()
+                  is_720p = ("720p" in pre)
+                  tagged_links.append((link, is_720p))
 
-              if not step1_candidates:
+              links_720p = [l for (l, is_720) in tagged_links if is_720]
+              chosen_m4u = links_720p[0] if links_720p else (tagged_links[0][0] if tagged_links else None)
+
+              if not chosen_m4u:
                   soup = BeautifulSoup(post_html, "lxml")
                   for a in soup.find_all("a", href=True):
                       href = urljoin(post_url, a["href"].strip())
-                      txt = a.get_text(" ", strip=True)
-                      if any(k in href.lower() for k in ("m4ulinks", "hubcloud", "vcloud", "gdflix")) or "download links" in txt.lower():
-                          if not href.startswith("#") and not href.startswith("javascript:") and "/drive/admin" not in href.lower():
-                              step1_candidates.append(href)
+                      if any(k in href.lower() for k in ("m4ulinks", "hubcloud", "vcloud", "gdflix")):
+                          if not href.startswith("#") and "/drive/admin" not in href.lower():
+                              chosen_m4u = href
+                              break
 
-              if not step1_candidates:
+              if not chosen_m4u:
                   return None
 
-              current_url = step1_candidates[len(step1_candidates) // 2]
-
-              if "m4ulinks" in current_url.lower():
+              if "m4ulinks" in chosen_m4u.lower():
                   try:
-                      r2 = session.get(current_url, headers={"Referer": post_url}, timeout=15)
+                      r2 = session.get(chosen_m4u, headers={"Referer": post_url}, timeout=15)
                       if r2.ok:
                           all_hop2 = [
                               u for u in re.findall(r"href=[\x27\"](https?://(?:hubcloud|vcloud|gdflix)\.[^\x27\"<>]+)[\x27\"]", r2.text, re.I)
                               if "/drive/admin" not in u.lower()
                           ]
                           hc_only = [u for u in all_hop2 if "hubcloud" in u.lower() or "vcloud" in u.lower()]
-                          chosen_pool = hc_only if hc_only else all_hop2
-                          if chosen_pool:
-                              current_url = chosen_pool[len(chosen_pool) // 2]
+                          if hc_only:
+                              return hc_only[0]
+                          elif all_hop2:
+                              return all_hop2[0]
                   except Exception as e:
-                      print(f"  [Warn] Hop 2 error on {current_url}: {e}")
+                      print(f"  [Warn] Hop error on {chosen_m4u}: {e}")
 
-              return current_url
+              return chosen_m4u
 
 
           def extract_all_episodes(session, post_url: str, post_html: str, default_season: int = 1):
-              m4u_links = re.findall(r"href=[\x27\"](https?://[^\x27\"<>]*m4ulinks[^\x27\"<>]*)[\x27\"]", post_html, re.I)
-              m4u_links = list(dict.fromkeys([u for u in m4u_links if "/drive/admin" not in u.lower()]))
+              """
+              Extracts real episodes present on a web series post.
+              STRICT REQUIREMENTS:
+              1. Prioritizes 720p resolution links above all else (never 1080p).
+              2. STRICT HubCloud priority for every episode (GDFlix only as fallback).
+              """
+              tagged_links = []
+              seen = set()
+              for m in re.finditer(r"href=[\x27\"](https?://[^\x27\"<>]*m4ulinks[^\x27\"<>]*)[\x27\"]", post_html, re.I):
+                  link = m.group(1).strip()
+                  if "/drive/admin" in link.lower() or link in seen:
+                      continue
+                  seen.add(link)
+                  start = max(0, m.start() - 150)
+                  pre = post_html[start:m.start()].lower()
+                  is_720p = ("720p" in pre)
+                  tagged_links.append((link, is_720p))
+
+              links_720p = [l for (l, is_720) in tagged_links if is_720]
+              links_to_process = links_720p if links_720p else [l for (l, _) in tagged_links]
 
               episodes_by_season_ep = {}
-              for m4u_url in m4u_links:
+              for m4u_url in links_to_process:
                   try:
                       r = session.get(m4u_url, headers={"Referer": post_url}, timeout=15)
                       if not r.ok:
@@ -391,12 +423,14 @@ jobs:
                                   re.I,
                               )
                               clean_hlinks = [u for u in hlinks if "/drive/admin" not in u.lower()]
-                              if clean_hlinks:
-                                  chosen_link = clean_hlinks[len(clean_hlinks) // 2]
+                              # STRICT HUBCLOUD PRIORITY:
+                              hc_only = [u for u in clean_hlinks if "hubcloud" in u.lower() or "vcloud" in u.lower()]
+                              chosen_link = hc_only[0] if hc_only else (clean_hlinks[0] if clean_hlinks else "")
+                              if chosen_link:
                                   for ep_n in current_episodes:
                                       if (s_num, ep_n) not in episodes_by_season_ep:
                                           episodes_by_season_ep[(s_num, ep_n)] = chosen_link
-                                  current_episodes = []
+                              current_episodes = []
 
                       if not episodes_by_season_ep:
                           all_hc = [
@@ -404,8 +438,10 @@ jobs:
                               if "/drive/admin" not in u.lower()
                           ]
                           clean_hc = list(dict.fromkeys(all_hc))
-                          if clean_hc:
-                              episodes_by_season_ep[(s_num, 1)] = clean_hc[len(clean_hc) // 2]
+                          hc_only = [u for u in clean_hc if "hubcloud" in u.lower() or "vcloud" in u.lower()]
+                          chosen = hc_only[0] if hc_only else (clean_hc[0] if clean_hc else "")
+                          if chosen:
+                              episodes_by_season_ep[(s_num, 1)] = chosen
                   except Exception as e:
                       print(f"  [Warn] Failed fetching m4ulinks {m4u_url}: {e}")
 
@@ -458,6 +494,7 @@ jobs:
 
 
           def search_real_post(session, base_url: str, title: str, require_series: bool = False):
+              """Searches lookup.php with fallback to HTML search."""
               search_terms = [title]
               base_title = re.sub(r"[:\-–].*$", "", title).strip()
               if base_title and base_title != title:
@@ -576,7 +613,7 @@ jobs:
 
               episodes_map = {}
               if content_type == "series":
-                  print(f"Extracting episodes for series '{clean_title}'...")
+                  print(f"Extracting 720p HubCloud episodes for series '{clean_title}'...")
                   episodes_map = extract_all_episodes(session, post_url, post_html, default_season)
 
               if content_type == "series" and episodes_map:
@@ -630,9 +667,9 @@ jobs:
                   ep_count, _ = sync_and_clean_series_episodes(
                       titles_ref, doc_id, clean_title, poster, episodes_map
                   )
-                  print(f"SUCCESS! Published Series '{clean_title}' with {ep_count} real episodes! (Doc ID: {doc_id})")
+                  print(f"SUCCESS! Published Series '{clean_title}' with {ep_count} real 720p HubCloud episodes! (Doc ID: {doc_id})")
               else:
-                  print(f"SUCCESS! Published Movie '{clean_title}' ({year}) with stream! (Doc ID: {doc_id})")
+                  print(f"SUCCESS! Published Movie '{clean_title}' ({year}) with 720p HubCloud stream! (Doc ID: {doc_id})")
 
               print("[Targeted Mode] Finished successfully. Minimal quota used.")
 
@@ -769,8 +806,6 @@ jobs:
                           continue
 
                       # For Series: if the rawTitle is identical to what we previously processed AND episodes exist, skip!
-                      # BUT if the website updated the title (e.g. '[Ep06 Added]' vs '[Ep04 Added]') or rawTitle wasn't stored yet,
-                      # we re-extract episodes to sync newly added episodes!
                       if content_type == "series" and stored_raw_title == post["raw_title"].strip() and stored_ep_count > 0:
                           print(f"  [Already Synced Series] '{clean_title}' has all {stored_ep_count} episodes. Skipping.")
                           skipped_count += 1
@@ -842,7 +877,7 @@ jobs:
                           titles_ref, doc_id, clean_title, poster, episodes_map
                       )
                       published_series += 1
-                      print(f"Synced Series '{clean_title}' with {ep_count} real episodes! | Rating: {rating}")
+                      print(f"Synced Series '{clean_title}' with {ep_count} real 720p HubCloud episodes! | Rating: {rating}")
                   else:
                       published_movies += 1
                       print(f"Synced Movie '{clean_title}' ({year}) | Rating: {rating}")
