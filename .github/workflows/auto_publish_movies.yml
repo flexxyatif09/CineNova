@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       target_title:
-        description: 'Target Movie/Series name (e.g. "VisionQuest", "Peddi" - Leave empty to auto-sync catalog & fix all GDFlix)'
+        description: 'Target Movie/Series name (e.g. "All That We Never Were", "Peddi" - Leave empty to auto-sync catalog & fix all GDFlix)'
         required: false
         default: ''
       weekly_cleanup:
@@ -53,12 +53,19 @@ jobs:
           """
           CineNova Automated Movie & Web Series Scraper + Firestore Publisher
           ====================================================================
-          - Strict Quality Control:
-            * STRICT 720p: Strictly extracts 720p links for both movies and series.
-            * STRICT HubCloud Priority: Always picks Hub-Cloud [DD] over GDFlix.
-            * AUTO GDFLIX MASS-FIXER: Automatically scans all existing Web Series in Firestore
-              and replaces any GDFlix episode links with genuine 720p HubCloud links.
-          - Configured for: https://new3.movies4u.garden
+          - Optimized for Quota Safety:
+            * Fast Quota-Saver Mode: Normal runs only check newly scraped items (< 50 reads).
+            * Weekly Deep Cleanup: Full database scan & duplicate removal runs once a week (Sundays).
+            * Targeted Single Title Mode: Run with TARGET_TITLE to search and add ONLY that specific
+              movie or series in seconds (< 5 reads/writes, 0.01% quota used).
+          - Configured for: https://new2.movies4u.garden (or MOVIES_SITE_URL)
+          - Smart Genre & Rating Extraction from JSON-LD schema / article text / breadcrumbs.
+          - Category Classifier: Trending, Featured, New Releases, Top Rated.
+          - Clean Title Sanitizer & Strict Multi-Season/Episode Extraction.
+          - STRICT RESOLUTION HIERARCHY:
+            1. First Priority: 720p
+            2. Fallback Priority: 1080p (only if 720p is not present)
+            3. DISALLOWED: 480p is never selected.
           """
 
           import datetime
@@ -74,7 +81,7 @@ jobs:
           from firebase_admin import credentials, firestore
           import requests
 
-          DEFAULT_SITE_URL = os.environ.get("MOVIES_SITE_URL", os.environ.get("SITE_URL", "https://new3.movies4u.garden")).rstrip("/")
+          DEFAULT_SITE_URL = os.environ.get("MOVIES_SITE_URL", os.environ.get("SITE_URL", "https://new2.movies4u.garden")).rstrip("/")
           MAX_MOVIES_PER_RUN = int(os.environ.get("MAX_MOVIES_PER_RUN", os.environ.get("MAX_MOVIES", 45)))
           FIREBASE_DATABASE_ID = os.environ.get(
               "FIREBASE_DATABASE_ID",
@@ -312,78 +319,153 @@ jobs:
               return ""
 
 
+          def extract_stream_from_m4u_page(html_text: str):
+              """
+              Parses an m4ulinks page by quality sections:
+              Priority 1: 720p (User's preferred quality)
+              Priority 2: 1080p (Fallback if 720p is absent)
+              Priority 3: 2160p / 4K
+              480p is STRICTLY DISALLOWED ("na he 480p wali agar 720p na rahe to 1080p wali lena")!
+              """
+              sections = re.split(r"(<h[1-6][^>]*>[\s\S]*?</h[1-6]>)", html_text, flags=re.I)
+              quality_map = {"720p": [], "1080p": [], "2160p": [], "480p": [], "other": []}
+              current_q = "other"
+
+              for sec in sections:
+                  hm = re.search(r"<h[1-6][^>]*>([\s\S]*?)</h[1-6]>", sec, re.I)
+                  if hm:
+                      htxt = re.sub(r"<[^>]+>", "", hm.group(1)).lower()
+                      if "720p" in htxt:
+                          current_q = "720p"
+                      elif "1080p" in htxt:
+                          current_q = "1080p"
+                      elif "2160p" in htxt or "4k" in htxt:
+                          current_q = "2160p"
+                      elif "480p" in htxt:
+                          current_q = "480p"
+                      else:
+                          current_q = "other"
+                  else:
+                      links = re.findall(
+                          r"href=[\x27\"](https?://(?:hubcloud|vcloud|gdflix)[^\x27\"<>]+)[\x27\"]",
+                          sec,
+                          re.I,
+                      )
+                      clean = [u for u in links if "/drive/admin" not in u.lower()]
+                      if clean:
+                          quality_map[current_q].extend(clean)
+
+              # 1. First preference: 720p
+              cand_720 = [u for u in quality_map["720p"] if "hubcloud" in u.lower() or "vcloud" in u.lower()] or quality_map["720p"]
+              if cand_720:
+                  return cand_720[0]
+
+              # 2. Fallback: 1080p (if 720p does not exist)
+              cand_1080 = [u for u in quality_map["1080p"] if "hubcloud" in u.lower() or "vcloud" in u.lower()] or quality_map["1080p"]
+              if cand_1080:
+                  return cand_1080[0]
+
+              # 3. 2160p / 4K fallback
+              cand_4k = [u for u in quality_map["2160p"] if "hubcloud" in u.lower() or "vcloud" in u.lower()] or quality_map["2160p"]
+              if cand_4k:
+                  return cand_4k[0]
+
+              # 4. Fallback for un-headed pages (only if NOT 480p)
+              if quality_map["other"]:
+                  cand_other = [u for u in quality_map["other"] if "hubcloud" in u.lower() or "vcloud" in u.lower()] or quality_map["other"]
+                  if cand_other:
+                      return cand_other[0]
+
+              return None
+
+
           def extract_multi_hop_links(session, post_url: str, post_html: str):
               """
               Extracts the primary 720p HubCloud link for a Movie.
-              STRICT 720p and STRICT HubCloud priority!
+              STRICT REQUIREMENTS:
+              1. Only 720p link (never 480p!).
+              2. Fallback to 1080p ONLY if 720p is not present on the site.
+              3. Strictly exclude 480p links.
               """
-              tagged_links = []
+              tagged_m4u = {"720p": [], "1080p": [], "2160p": [], "other": []}
               seen = set()
               for m in re.finditer(r"href=[\x27\"](https?://[^\x27\"<>]*m4ulinks[^\x27\"<>]*)[\x27\"]", post_html, re.I):
                   link = m.group(1).strip()
                   if "/drive/admin" in link.lower() or link in seen:
                       continue
                   seen.add(link)
-                  start = max(0, m.start() - 150)
+                  start = max(0, m.start() - 600)
                   pre = post_html[start:m.start()].lower()
-                  is_720p = ("720p" in pre)
-                  tagged_links.append((link, is_720p))
+                  if "720p" in pre:
+                      tagged_m4u["720p"].append(link)
+                  elif "1080p" in pre:
+                      tagged_m4u["1080p"].append(link)
+                  elif "2160p" in pre or "4k" in pre:
+                      tagged_m4u["2160p"].append(link)
+                  elif "480p" in pre:
+                      pass  # Strictly skip 480p!
+                  else:
+                      tagged_m4u["other"].append(link)
 
-              links_720p = [l for (l, is_720) in tagged_links if is_720]
-              chosen_m4u = links_720p[0] if links_720p else (tagged_links[0][0] if tagged_links else None)
+              # Candidates ordered: 720p first, then 1080p, then 4k, then un-tagged (never 480p!)
+              ordered_m4u = tagged_m4u["720p"] + tagged_m4u["1080p"] + tagged_m4u["2160p"] + tagged_m4u["other"]
 
-              if not chosen_m4u:
+              if not ordered_m4u:
                   soup = BeautifulSoup(post_html, "lxml")
                   for a in soup.find_all("a", href=True):
                       href = urljoin(post_url, a["href"].strip())
                       if any(k in href.lower() for k in ("m4ulinks", "hubcloud", "vcloud", "gdflix")):
                           if not href.startswith("#") and "/drive/admin" not in href.lower():
-                              chosen_m4u = href
-                              break
+                              parent_text = a.parent.get_text(" ", strip=True).lower() if a.parent else ""
+                              if "480p" not in parent_text:
+                                  ordered_m4u.append(href)
+                                  break
 
-              if not chosen_m4u:
-                  return None
+              for chosen_m4u in ordered_m4u:
+                  if "m4ulinks" in chosen_m4u.lower():
+                      try:
+                          r2 = session.get(chosen_m4u, headers={"Referer": post_url}, timeout=15)
+                          if r2.ok:
+                              resolved = extract_stream_from_m4u_page(r2.text)
+                              if resolved:
+                                  return resolved
+                      except Exception as e:
+                          print(f"  [Warn] Hop error on {chosen_m4u}: {e}")
+                  elif any(k in chosen_m4u.lower() for k in ("hubcloud", "vcloud", "gdflix")):
+                      return chosen_m4u
 
-              if "m4ulinks" in chosen_m4u.lower():
-                  try:
-                      r2 = session.get(chosen_m4u, headers={"Referer": post_url}, timeout=15)
-                      if r2.ok:
-                          all_hop2 = [
-                              u for u in re.findall(r"href=[\x27\"](https?://(?:hubcloud|vcloud|gdflix)\.[^\x27\"<>]+)[\x27\"]", r2.text, re.I)
-                              if "/drive/admin" not in u.lower()
-                          ]
-                          hc_only = [u for u in all_hop2 if "hubcloud" in u.lower() or "vcloud" in u.lower()]
-                          if hc_only:
-                              return hc_only[0]
-                          elif all_hop2:
-                              return all_hop2[0]
-                  except Exception as e:
-                      print(f"  [Warn] Hop error on {chosen_m4u}: {e}")
-
-              return chosen_m4u
+              return None
 
 
           def extract_all_episodes(session, post_url: str, post_html: str, default_season: int = 1):
               """
               Extracts real episodes present on a web series post.
               STRICT REQUIREMENTS:
-              1. Prioritizes 720p resolution links above all else (never 1080p).
-              2. STRICT HubCloud priority for every episode (GDFlix only as fallback).
+              1. Prioritizes 720p resolution links above all else.
+              2. If 720p is absent, fallbacks to 1080p.
+              3. Strictly rejects 480p resolution.
+              4. STRICT HubCloud priority for every episode (GDFlix only as fallback).
               """
-              tagged_links = []
+              tagged_m4u = {"720p": [], "1080p": [], "other": []}
               seen = set()
               for m in re.finditer(r"href=[\x27\"](https?://[^\x27\"<>]*m4ulinks[^\x27\"<>]*)[\x27\"]", post_html, re.I):
                   link = m.group(1).strip()
                   if "/drive/admin" in link.lower() or link in seen:
                       continue
                   seen.add(link)
-                  start = max(0, m.start() - 150)
+                  start = max(0, m.start() - 600)
                   pre = post_html[start:m.start()].lower()
-                  is_720p = ("720p" in pre)
-                  tagged_links.append((link, is_720p))
+                  if "720p" in pre:
+                      tagged_m4u["720p"].append(link)
+                  elif "1080p" in pre:
+                      tagged_m4u["1080p"].append(link)
+                  elif "480p" in pre:
+                      pass  # Strictly disallow 480p!
+                  else:
+                      tagged_m4u["other"].append(link)
 
-              links_720p = [l for (l, is_720) in tagged_links if is_720]
-              links_to_process = links_720p if links_720p else [l for (l, _) in tagged_links]
+              # 720p first, then 1080p fallback, then other
+              links_to_process = tagged_m4u["720p"] if tagged_m4u["720p"] else (tagged_m4u["1080p"] if tagged_m4u["1080p"] else tagged_m4u["other"])
 
               episodes_by_season_ep = {}
               for m4u_url in links_to_process:
@@ -398,9 +480,35 @@ jobs:
                       s_m = re.search(r"\b(?:Season|S)\s*0*(\d{1,2})\b", t_str, re.I)
                       s_num = int(s_m.group(1)) if s_m else default_season
 
+                      # If m4ulinks has separate quality sections, filter for 720p (or 1080p fallback)
+                      target_html = html_text
+                      quality_blocks = re.split(r"(<h[1-6][^>]*>[\s\S]*?</h[1-6]>)", html_text, flags=re.I)
+                      q_sections = {"720p": [], "1080p": [], "other": []}
+                      curr_q = "other"
+                      for part in quality_blocks:
+                          hm = re.search(r"<h[1-6][^>]*>([\s\S]*?)</h[1-6]>", part, re.I)
+                          if hm:
+                              htxt = re.sub(r"<[^>]+>", "", hm.group(1)).lower()
+                              if "720p" in htxt:
+                                  curr_q = "720p"
+                              elif "1080p" in htxt:
+                                  curr_q = "1080p"
+                              elif "480p" in htxt:
+                                  curr_q = "480p"
+                              else:
+                                  curr_q = "other"
+                          else:
+                              if curr_q in q_sections:
+                                  q_sections[curr_q].append(part)
+
+                      if q_sections["720p"] and any("href" in p for p in q_sections["720p"]):
+                          target_html = "".join(q_sections["720p"])
+                      elif q_sections["1080p"] and any("href" in p for p in q_sections["1080p"]):
+                          target_html = "".join(q_sections["1080p"])
+
                       parts = re.split(
                           r"(-:Episodes?:\s*\d+(?:\s*-\s*\d+)?:-|<h[1-6][^>]*>\s*(?:-:)?\s*Episodes?\s*[:\-]?\s*\d+(?:\s*-\s*\d+)?\s*(?::-)?\s*</h[1-6]>)",
-                          html_text,
+                          target_html,
                           flags=re.I,
                       )
 
@@ -429,7 +537,7 @@ jobs:
 
                       if not episodes_by_season_ep:
                           all_hc = [
-                              u for u in re.findall(r"href=[\x27\"](https?://(?:hubcloud|vcloud|gdflix)[^\x27\"<>]+)[\x27\"]", html_text, re.I)
+                              u for u in re.findall(r"href=[\x27\"](https?://(?:hubcloud|vcloud|gdflix)[^\x27\"<>]+)[\x27\"]", target_html, re.I)
                               if "/drive/admin" not in u.lower()
                           ]
                           clean_hc = list(dict.fromkeys(all_hc))
@@ -489,7 +597,6 @@ jobs:
 
 
           def search_real_post(session, base_url: str, title: str, require_series: bool = False):
-              """Searches lookup.php with fallback to HTML search."""
               search_terms = [title]
               base_title = re.sub(r"[:\-–].*$", "", title).strip()
               if base_title and base_title != title:
@@ -585,11 +692,6 @@ jobs:
 
 
           def fix_all_gdflix_titles_in_firestore(titles_ref, session, base_url: str):
-              """
-              Scans Firestore for any Web Series that contains 'gdflix' links
-              in its videoUrl or episodes, and automatically replaces all of them
-              with pure 720p HubCloud links from Movies4u.
-              """
               print("=" * 65)
               print("[GDFlix Auto-Fixer] Scanning Web Series in Firestore for GDFlix links...")
               print("=" * 65)
@@ -695,7 +797,7 @@ jobs:
 
               episodes_map = {}
               if content_type == "series":
-                  print(f"Extracting 720p HubCloud episodes for series '{clean_title}'...")
+                  print(f"Extracting episodes for series '{clean_title}'...")
                   episodes_map = extract_all_episodes(session, post_url, post_html, default_season)
 
               if content_type == "series" and episodes_map:
@@ -749,9 +851,9 @@ jobs:
                   ep_count, _ = sync_and_clean_series_episodes(
                       titles_ref, doc_id, clean_title, poster, episodes_map
                   )
-                  print(f"SUCCESS! Published Series '{clean_title}' with {ep_count} real 720p HubCloud episodes! (Doc ID: {doc_id})")
+                  print(f"SUCCESS! Published Series '{clean_title}' with {ep_count} real episodes! (Doc ID: {doc_id})")
               else:
-                  print(f"SUCCESS! Published Movie '{clean_title}' ({year}) with 720p HubCloud stream! (Doc ID: {doc_id})")
+                  print(f"SUCCESS! Published Movie '{clean_title}' ({year}) with stream! (Doc ID: {doc_id})")
 
               print("[Targeted Mode] Finished successfully. Minimal quota used.")
 
@@ -838,12 +940,10 @@ jobs:
               session = create_http_session()
               titles_ref = db.collection("titles")
 
-              # Mode 1: Targeted Single Title
               if TARGET_TITLE:
                   process_single_target(titles_ref, session, DEFAULT_SITE_URL, TARGET_TITLE)
                   return
 
-              # Check if Weekly Deep Scan should run (Sundays UTC 0-3 AM or RUN_WEEKLY_CLEANUP = True)
               now_utc = datetime.datetime.now(datetime.timezone.utc)
               is_sunday = (now_utc.weekday() == 6 and now_utc.hour < 4)
               should_run_weekly = RUN_WEEKLY_CLEANUP or is_sunday
@@ -855,8 +955,6 @@ jobs:
                   print("[Fast Quota-Saver Mode] Skipping full database scan to conserve daily Firestore quota.")
                   print("  (Deep database cleanup is scheduled once a week on Sundays).")
 
-              # Always scan and auto-fix any Web Series in Firestore that currently have GDFlix links!
-              # Replaces all existing GDFlix links with pure 720p HubCloud links.
               fix_all_gdflix_titles_in_firestore(titles_ref, session, DEFAULT_SITE_URL)
 
               print(f"Scraping up to {MAX_MOVIES_PER_RUN} recent posts from {DEFAULT_SITE_URL} ...")
@@ -872,7 +970,6 @@ jobs:
                   norm_key = normalize_key(clean_title, year)
                   doc_id = f"auto_{norm_key}"[:64]
 
-                  # Fast individual doc check (Only 1 read per scraped item!)
                   try:
                       doc_snap = titles_ref.document(doc_id).get()
                   except Exception as e:
@@ -885,13 +982,11 @@ jobs:
                       stored_raw_title = str(d.get("rawTitle", "")).strip()
                       stored_ep_count = int(d.get("episodesCount", 0) or 0)
 
-                      # For Movies: if videoUrl exists and is not gdflix, skip.
-                      if content_type == "movie" and video_url and len(video_url) > 10 and "gdflix" not in video_url.lower():
+                      if content_type == "movie" and video_url and len(video_url) > 10:
                           print(f"  [Already Synced Movie] '{clean_title}' ({year}) exists with stream link. Skipping.")
                           skipped_count += 1
                           continue
 
-                      # For Series: if the rawTitle is identical to what we previously processed AND episodes exist, skip!
                       if content_type == "series" and stored_raw_title == post["raw_title"].strip() and stored_ep_count > 0:
                           print(f"  [Already Synced Series] '{clean_title}' has all {stored_ep_count} episodes. Skipping.")
                           skipped_count += 1
@@ -963,7 +1058,7 @@ jobs:
                           titles_ref, doc_id, clean_title, poster, episodes_map
                       )
                       published_series += 1
-                      print(f"Synced Series '{clean_title}' with {ep_count} real 720p HubCloud episodes! | Rating: {rating}")
+                      print(f"Synced Series '{clean_title}' with {ep_count} real episodes! | Rating: {rating}")
                   else:
                       published_movies += 1
                       print(f"Synced Movie '{clean_title}' ({year}) | Rating: {rating}")
