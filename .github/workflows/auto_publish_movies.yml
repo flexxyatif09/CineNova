@@ -16,7 +16,7 @@ on:
       site_url:
         description: 'Target Movie Website URL'
         required: false
-        default: 'https://new3.movies4u.garden'
+        default: 'https://new4.movies4u.garden'
       max_items:
         description: 'Kitni movies/series scrape karni hain (Default: 40)'
         required: false
