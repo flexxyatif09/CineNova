@@ -43,7 +43,7 @@ jobs:
         env:
           FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
           FIREBASE_DATABASE_ID: "ai-studio-android-devbuild-a9589065-5570-4074-a613-1c0430bf6841"
-          MOVIES_SITE_URL: ${{ github.event.inputs.site_url || vars.MOVIES_SITE_URL || 'https://new3.movies4u.garden' }}
+          MOVIES_SITE_URL: ${{ github.event.inputs.site_url || vars.MOVIES_SITE_URL || 'https://new4.movies4u.garden' }}
           MAX_MOVIES_PER_RUN: ${{ github.event.inputs.max_items || '40' }}
           TARGET_TITLE: ${{ github.event.inputs.target_title || '' }}
           RUN_WEEKLY_CLEANUP: ${{ github.event.inputs.weekly_cleanup || 'false' }}
