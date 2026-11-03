@@ -697,12 +697,10 @@ jobs:
                   for doc in titles_ref.stream():
                       d = doc.to_dict() or {}
                       t_name = d.get("title", "")
-                      g = d.get("genres", []) or []
-                      is_animeish = ("Anime" in g or "Animation" in g or doc.id.startswith("anime_")
-                                     or d.get("authorId") == "github_automation")
+                      # SAFETY: yeh script SIRF apne banaye "anime_" docs ko chhuti hai.
+                      # Movies / web-series / baaki pipelines ("auto_..." etc.) ko kabhi delete/hide nahi karti.
+                      is_animeish = doc.id.startswith("anime_")
 
-                      # FIX: pehle har title (movies samet) par blocked-keyword delete chalta tha -> Batman/Avengers/Barbie
-                      # jaisi normal movies bhi delete ho sakti thi. Ab sirf anime-type docs par.
                       if is_animeish and (is_title_blocked(t_name) or is_title_blocked(doc.id)):
                           log(f"  [Auto-Cleanup] Deleting blocked non-anime: '{t_name}' ({doc.id})")
                           try:
@@ -1114,8 +1112,8 @@ jobs:
                   if time_used() > SOFT_DEADLINE_SEC:
                       log("[Origin-Cleanup] Time budget reached.")
                       break
-                  if info.get("authorId") != "github_automation":
-                      continue  # manual / baaki titles ko kabhi nahi chhedna
+                  if not doc_id.startswith("anime_") or info.get("authorId") != "github_automation":
+                      continue  # movies / web-series / manual titles ko kabhi nahi chhedna
                   title = info.get("title", "")
                   cc = None if (force and info.get("originCountry") != "ACCEPTED") else _origin_stored(info)
                   if title.strip().lower() in ORIGIN_ALLOWLIST:
@@ -1461,8 +1459,7 @@ jobs:
                       log("[Razorshell Fixer] Time budget reached, baaki agle run me.")
                       break
                   d = doc.to_dict() or {}
-                  g = d.get("genres", []) or []
-                  if not ("Anime" in g or "Animation" in g or doc.id.startswith("anime_")):
+                  if not doc.id.startswith("anime_"):
                       continue
                   # FIX: pehle har run me fail hone wale sab titles dobara try hote the (run ka poora time waste).
                   if not link_recheck_due(d, days=2, key="razorFixTriedAt"):
@@ -1538,6 +1535,35 @@ jobs:
               log(f"[Razorshell Fixer] Done. titles tried={tried}, episodes fixed={fixed_total}")
 
 
+          # ---------------------------------------------------------------- recovery
+
+          def recover_wrongly_hidden(titles_ref):
+              """Purane galat cleanup se hide hue NON-anime titles (movies, web-series etc.) wapas publish karo."""
+              try:
+                  docs = list(titles_ref.where("hiddenByOriginCheck", "==", True).stream())
+              except Exception as e:
+                  log(f"[Recovery][Warn] Query failed: {e}")
+                  return 0
+              restored = 0
+              for doc in docs:
+                  if doc.id.startswith("anime_"):
+                      continue  # anime_ docs ko origin-cleanup khud handle karta hai
+                  d = doc.to_dict() or {}
+                  try:
+                      doc.reference.update({
+                          "isPublished": True,
+                          "hiddenByOriginCheck": False,
+                          "originCountry": firestore.DELETE_FIELD,
+                          "originCheckedAt": firestore.DELETE_FIELD,
+                      })
+                      restored += 1
+                      log(f"  [Recovery] Restored '{d.get('title', doc.id)}' ({doc.id})")
+                  except Exception as e:
+                      log(f"  [Recovery][Warn] Could not restore {doc.id}: {e}")
+              log(f"[Recovery] Done. Restored {restored} non-anime titles.")
+              return restored
+
+
           # ---------------------------------------------------------------- entry point
 
           def main():
@@ -1549,6 +1575,7 @@ jobs:
               session = create_http_session()
               titles_ref = db.collection("titles")
 
+              recover_wrongly_hidden(titles_ref)
               existing_anime = load_fast_existing_anime(titles_ref)
 
               # 1) Weekly deep audit mode
