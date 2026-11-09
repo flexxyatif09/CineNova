@@ -16,7 +16,7 @@ on:
       site_url:
         description: 'Target Movie Website URL'
         required: false
-        default: 'https://new5.movies4u.garden'
+        default: 'https://new6.movies4u.garden'
       max_items:
         description: 'Kitni movies/series scrape karni hain (Default: 40)'
         required: false
@@ -43,7 +43,7 @@ jobs:
         env:
           FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
           FIREBASE_DATABASE_ID: "ai-studio-android-devbuild-a9589065-5570-4074-a613-1c0430bf6841"
-          MOVIES_SITE_URL: ${{ github.event.inputs.site_url || vars.MOVIES_SITE_URL || 'https://new5.movies4u.garden' }}
+          MOVIES_SITE_URL: ${{ github.event.inputs.site_url || vars.MOVIES_SITE_URL || 'https://new6.movies4u.garden' }}
           MAX_MOVIES_PER_RUN: ${{ github.event.inputs.max_items || '40' }}
           TARGET_TITLE: ${{ github.event.inputs.target_title || '' }}
           RUN_WEEKLY_CLEANUP: ${{ github.event.inputs.weekly_cleanup || 'false' }}
@@ -58,7 +58,7 @@ jobs:
             * Weekly Deep Cleanup: Full database scan & duplicate removal runs once a week (Sundays).
             * Targeted Single Title Mode: Run with TARGET_TITLE to search and add ONLY that specific
               movie or series in seconds (< 5 reads/writes, 0.01% quota used).
-          - Configured for: https://new5.movies4u.garden (or MOVIES_SITE_URL)
+          - Configured for: https://new6.movies4u.garden (or MOVIES_SITE_URL)
           - Smart Genre & Rating Extraction from JSON-LD schema / article text / breadcrumbs.
           - Category Classifier: Trending, Featured, New Releases, Top Rated.
           - Clean Title Sanitizer & Strict Multi-Season/Episode Extraction.
@@ -81,7 +81,7 @@ jobs:
           from firebase_admin import credentials, firestore
           import requests
 
-          DEFAULT_SITE_URL = os.environ.get("MOVIES_SITE_URL", os.environ.get("SITE_URL", "https://new5.movies4u.garden")).rstrip("/")
+          DEFAULT_SITE_URL = os.environ.get("MOVIES_SITE_URL", os.environ.get("SITE_URL", "https://new6.movies4u.garden")).rstrip("/")
           MAX_MOVIES_PER_RUN = int(os.environ.get("MAX_MOVIES_PER_RUN", os.environ.get("MAX_MOVIES", 45)))
           FIREBASE_DATABASE_ID = os.environ.get(
               "FIREBASE_DATABASE_ID",
